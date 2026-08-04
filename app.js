@@ -60,7 +60,7 @@ var KAN_COLS = [
 //  1. JSONP API
 // ═══════════════════════════════════════════════════════════
 function _api(action, data, ok, fail) {
-  if (!GAS_URL || GAS_URL === 'PASTE_YOUR_GAS_DEPLOYMENT_URL_HERE') {
+  if (!GAS_URL || GAS_URL === 'https://script.google.com/macros/s/AKfycbxX3iG_G35Q3xK87v0Abfxmc0LTLTl-UYw4G57X5rV2CaIb6ffo-OM15iEYXrsqEvjQ/exec') {
     toast('⚠ Set GAS_URL in apiconfig.js', 'err'); if (fail) fail({message:'GAS_URL not set'}); return;
   }
   var cbN = '_gcb' + (++_cbIdx), t;
