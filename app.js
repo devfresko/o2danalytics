@@ -53,27 +53,30 @@ var VN = {
 
 /* ─────────────────────────────────────────────────────────────
    1. API LAYER
+   Always injects _SESSION auth. Pass explicit authOverride for login.
 ───────────────────────────────────────────────────────────── */
-function _api(action, data, ok, fail) {
+function _api(action, data, ok, fail, authOverride) {
   if (!GAS_URL || GAS_URL.indexOf('PASTE') >= 0) {
-    toast('Set GAS_URL in apiconfig.js', 'err'); if (fail) fail({message:'Not configured'}); return;
+    toast('Set GAS_URL in apiconfig.js', 'err'); if(fail) fail({message:'Not configured'}); return;
   }
-  var cb = '_gcb' + (++_cbIdx); var t;
-  window[cb] = function(r) {
+  var cb='_gcb'+(++_cbIdx); var t;
+  window[cb]=function(r){
     clearTimeout(t);
     var s=document.getElementById('_s_'+cb); if(s) s.parentNode.removeChild(s);
     try{delete window[cb];}catch(e){}
     if(ok) ok(r);
   };
-  t = setTimeout(function(){
+  t=setTimeout(function(){
     try{delete window[cb];}catch(e){}
-    if(fail) fail({message:'Timed out'});
+    if(fail) fail({message:'Request timed out. Check GAS deployment.'});
   }, APP_CONFIG.apiTimeoutMs||28000);
 
-  var pl = {action:action, data:data||{}, auth:_SESSION?{email:_SESSION.email,password:_SESSION.password}:null};
+  // Use explicit authOverride (for login), else use _SESSION
+  var auth = authOverride || (_SESSION ? {email:_SESSION.email, password:_SESSION.password} : null);
+  var pl = {action:action, data:data||{}, auth:auth};
   var url = GAS_URL+'?callback='+cb+'&payload='+encodeURIComponent(JSON.stringify(pl));
   var s=document.createElement('script'); s.id='_s_'+cb; s.src=url;
-  s.onerror=function(){clearTimeout(t);try{delete window[cb];}catch(e){}if(fail)fail({message:'Network error'});};
+  s.onerror=function(){clearTimeout(t);try{delete window[cb];}catch(e){}if(fail)fail({message:'Network error. Check internet connection.'});};
   document.head.appendChild(s);
 }
 
@@ -81,43 +84,37 @@ function _api(action, data, ok, fail) {
    2. AUTH
 ───────────────────────────────────────────────────────────── */
 function doLogin() {
-  var email = (document.getElementById('li-email')||{}).value||'';
+  var email = ((document.getElementById('li-email')||{}).value||'').trim();
   var pass  = (document.getElementById('li-pass')||{}).value||'';
-  var err   = document.getElementById('login-err');
   var btn   = document.getElementById('login-btn');
   if (!email || !pass) { showLoginErr('Enter email and password.'); return; }
   btn.innerHTML = '<i class="fas fa-circle-notch spinning"></i> Signing in…'; btn.disabled=true;
+  showLoginErr('');
+
+  // Pass auth explicitly as authOverride — _SESSION is null at login time
   _api('login', {}, function(r) {
     btn.innerHTML='<i class="fas fa-sign-in-alt"></i> Sign In'; btn.disabled=false;
-    if (!r||!r.success) { showLoginErr(r&&r.error?r.error:'Invalid credentials.'); return; }
+    if (!r || !r.success) {
+      showLoginErr(r && r.error ? r.error : 'Invalid email or password.');
+      return;
+    }
     _SESSION = { email:email, password:pass, name:r.user.name, role:r.user.role };
     document.getElementById('login-wrap').style.display = 'none';
     _applyRole();
     loadAll(false);
   }, function(e) {
     btn.innerHTML='<i class="fas fa-sign-in-alt"></i> Sign In'; btn.disabled=false;
-    showLoginErr('Connection failed. Check GAS URL.');
-  }, {email:email, password:pass});
+    showLoginErr('Connection failed: ' + e.message);
+  }, {email:email, password:pass}); // ← authOverride passed here
 }
 
-// Override _api to inject auth from _SESSION
-var _apiOrig = _api;
-_api = function(action, data, ok, fail) {
-  if (!GAS_URL || GAS_URL.indexOf('PASTE') >= 0) {
-    toast('Set GAS_URL in apiconfig.js', 'err'); if(fail)fail({message:'Not configured'}); return;
-  }
-  var cb='_gcb'+(++_cbIdx); var t;
-  window[cb]=function(r){clearTimeout(t);var s=document.getElementById('_s_'+cb);if(s)s.parentNode.removeChild(s);try{delete window[cb];}catch(e){}if(ok)ok(r);};
-  t=setTimeout(function(){try{delete window[cb];}catch(e){}if(fail)fail({message:'Timed out'});}, APP_CONFIG.apiTimeoutMs||28000);
-  var auth=_SESSION?{email:_SESSION.email,password:_SESSION.password}:null;
-  var pl={action:action,data:data||{},auth:auth};
-  var url=GAS_URL+'?callback='+cb+'&payload='+encodeURIComponent(JSON.stringify(pl));
-  var s=document.createElement('script');s.id='_s_'+cb;s.src=url;
-  s.onerror=function(){clearTimeout(t);try{delete window[cb];}catch(e){}if(fail)fail({message:'Network error'});};
-  document.head.appendChild(s);
-};
-
-function showLoginErr(msg){var e=document.getElementById('login-err');if(e){e.textContent=msg;e.classList.add('show');}}
+function showLoginErr(msg){
+  var e=document.getElementById('login-err');
+  if(!e) return;
+  if(!msg){e.textContent='';e.classList.remove('show');return;}
+  e.textContent=msg;
+  e.classList.add('show');
+}
 function doLogout(){_SESSION=null;document.getElementById('login-wrap').style.display='flex';_D.orders=[];toast('Signed out');}
 function isManagement(){return _SESSION&&_SESSION.role==='management';}
 
