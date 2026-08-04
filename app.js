@@ -1,1618 +1,1110 @@
 // ============================================================
-//  O2D Analytics — app.js
-//  Requires: apiconfig.js (loaded before this in index.html)
-//  Chart.js loaded via CDN in index.html
+//  O2D Analytics — app.js  v3  (Masters-aware)
+//  Requires: apiconfig.js loaded first
+//  Backend now returns _customerName, _locationName,
+//  _itemName, _vendName on all rows
 // ============================================================
 
-// ── Global State ────────────────────────────────────────────
-var _D = {                     // master data cache
-  orders:         [],
-  orderDetails:   [],
-  receivedItems:  [],
-  returnedItems:  [],
-  pdfs:           [],
-  indents:        [],
-  purchasedItems: [],
-  reimbursements: [],
-  dumpItems:      [],
-  lastTs:         null
+/* ── Global State ─────────────────────────────────────────── */
+var _D = {
+  orders:[], orderDetails:[], receivedItems:[],
+  returnedItems:[], pdfs:[], indents:[],
+  purchasedItems:[], reimbursements:[], dumpItems:[],
+  masters:{ customers:[], locations:[], items:[], vendors:[] },
+  lastTs: null
 };
 
-var _currentView  = APP_CONFIG.defaultView || 'kanban';
-var _cbIdx        = 0;
-var _chartInstances = {};      // keyed by canvas id
-var _calYear      = new Date().getFullYear();
-var _calMonth     = new Date().getMonth();
-var _galleryMode  = 'load';    // 'load' | 'receive'
-var _tblSort      = { col: 'Expected Delivery Date', dir: -1 };
-var _tblFilter    = { search: '', status: '', wh: '' };
-var _pivotRow     = 'Warehouse';
-var _pivotCol     = '_status';
-var _timelineOID  = '';
-var _autoRefTimer = null;
+/* In-memory lookup maps (built from masters after load) */
+var _M = { cust:{}, loc:{}, item:{}, vend:{} };
 
-// Pipeline status colours (must match CSS variables)
-var STATUS_CLASS = {
-  'Pending':       'pending',
-  'WH Loaded':     'wh-loaded',
-  'In-Transit':    'in-transit',
-  'Delivered':     'delivered',
-  'DEO Collected': 'deo',
-  'DEO Approved':  'deo',
-  'Invoiced':      'invoiced'
+var _view    = 'kanban';
+var _cbIdx   = 0;
+var _charts  = {};
+var _calYear = new Date().getFullYear();
+var _calMonth= new Date().getMonth();
+var _galMode = 'load';
+var _tblPage = 1;
+var _TBL_PER = 50;
+var _tlOID   = '';
+var _pivRow  = 'Customer';
+var _pivCol  = '_status';
+var _autoT   = null;
+var _invLink = '';
+
+var _F = {
+  search:'', status:'', customer:'', location:'', deliveryBoy:'',
+  dateFrom:'', dateTo:'', itemCat:'', hasCrates:'',
+  hasPhoto:'', invoiced:'', wh:''
 };
 
-var KANBAN_COLS = [
-  { key: 'Pending',       label: 'Pending',       icon: '⏳', color: '#6366F1' },
-  { key: 'WH Loaded',     label: 'WH Loaded',     icon: '📦', color: '#8B5CF6' },
-  { key: 'Delivered',     label: 'Delivered',      icon: '🚚', color: '#F59E0B' },
-  { key: 'DEO Collected', label: 'DEO Collected',  icon: '✔️', color: '#3B82F6' },
-  { key: 'DEO Approved',  label: 'DEO Approved',   icon: '✅', color: '#10B981' },
-  { key: 'Invoiced',      label: 'Invoiced',       icon: '🧾', color: '#06B6D4' }
+/* ── Pipeline constants ──────────────────────────────────────*/
+var S_BADGE = {
+  'Pending':       'badge-pending',
+  'WH Loaded':     'badge-wh-loaded',
+  'Delivered':     'badge-delivered',
+  'DEO Collected': 'badge-deo',
+  'DEO Approved':  'badge-approved',
+  'Invoiced':      'badge-invoiced'
+};
+
+var KAN_COLS = [
+  { key:'Pending',       label:'Pending',       color:'#6366F1', icon:'fa-hourglass-start' },
+  { key:'WH Loaded',     label:'WH Loaded',     color:'#7C3AED', icon:'fa-box' },
+  { key:'Delivered',     label:'Delivered',     color:'#F59E0B', icon:'fa-truck' },
+  { key:'DEO Collected', label:'DEO Collected', color:'#4285F4', icon:'fa-check-circle' },
+  { key:'DEO Approved',  label:'DEO Approved',  color:'#34A853', icon:'fa-clipboard-check' },
+  { key:'Invoiced',      label:'Invoiced',      color:'#06B6D4', icon:'fa-file-invoice' }
 ];
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 1 — JSONP API LAYER
-// ────────────────────────────────────────────────────────────
-
-function _api(action, data, ok, err) {
+// ═══════════════════════════════════════════════════════════
+//  1. JSONP API
+// ═══════════════════════════════════════════════════════════
+function _api(action, data, ok, fail) {
   if (!GAS_URL || GAS_URL === 'PASTE_YOUR_GAS_DEPLOYMENT_URL_HERE') {
-    _toast('⚠️ GAS URL not set in apiconfig.js', 'err');
-    if (err) err({ message: 'GAS_URL not configured' });
-    return;
+    toast('⚠ Set GAS_URL in apiconfig.js', 'err'); if (fail) fail({message:'GAS_URL not set'}); return;
   }
-
-  var cbName = '_gcb' + (++_cbIdx);
-  var timer;
-
-  window[cbName] = function(r) {
-    clearTimeout(timer);
-    var s = document.getElementById('_s_' + cbName);
-    if (s) s.parentNode.removeChild(s);
-    try { delete window[cbName]; } catch(e) {}
+  var cbN = '_gcb' + (++_cbIdx), t;
+  window[cbN] = function(r) {
+    clearTimeout(t);
+    var s=document.getElementById('_s_'+cbN); if(s) s.parentNode.removeChild(s);
+    try{delete window[cbN];}catch(e){}
     if (ok) ok(r);
   };
+  t = setTimeout(function(){
+    try{delete window[cbN];}catch(e){}
+    if (fail) fail({message:'Timed out ('+(APP_CONFIG.apiTimeoutMs||25000)/1000+'s)'});
+  }, APP_CONFIG.apiTimeoutMs||25000);
 
-  timer = setTimeout(function() {
-    var s = document.getElementById('_s_' + cbName);
-    if (s) s.parentNode.removeChild(s);
-    try { delete window[cbName]; } catch(e) {}
-    if (err) err({ message: 'Request timed out after ' + (APP_CONFIG.apiTimeoutMs / 1000) + 's' });
-  }, APP_CONFIG.apiTimeoutMs || 25000);
-
-  var payload = encodeURIComponent(JSON.stringify({
-    action: action,
-    data:   data || {}
-  }));
-
-  var url = GAS_URL + '?callback=' + cbName + '&payload=' + payload;
-  var s   = document.createElement('script');
-  s.id    = '_s_' + cbName;
-  s.src   = url;
-  s.onerror = function() {
-    clearTimeout(timer);
-    try { delete window[cbName]; } catch(e) {}
-    if (err) err({ message: 'Network error — check GAS URL' });
-  };
+  var url = GAS_URL+'?callback='+cbN+'&payload='+encodeURIComponent(JSON.stringify({action:action,data:data||{}}));
+  var s = document.createElement('script');
+  s.id='_s_'+cbN; s.src=url;
+  s.onerror=function(){ clearTimeout(t); try{delete window[cbN];}catch(e){} if(fail) fail({message:'Network error'}); };
   document.head.appendChild(s);
 }
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 2 — DATA LOADING
-// ────────────────────────────────────────────────────────────
-
-function _loadAll(silent) {
-  _setStatus('loading', 'Loading…');
-  if (!silent) _showOverlay('Fetching O2D data…');
-
-  var btn = document.getElementById('refresh-btn');
-  if (btn) btn.classList.add('spinning');
+// ═══════════════════════════════════════════════════════════
+//  2. DATA LOAD
+// ═══════════════════════════════════════════════════════════
+function loadAll(silent) {
+  setBadge('loading','Loading…');
+  if (!silent) setLoader('Fetching O2D data + Masters…');
+  var ico=document.getElementById('refresh-ico'); if(ico) ico.classList.add('spinning');
 
   _api('getAllData', {}, function(r) {
-    if (btn) btn.classList.remove('spinning');
-    _hideOverlay();
+    if(ico) ico.classList.remove('spinning');
+    hideLoader();
+    if (!r||!r.success) { setBadge('error','Error'); toast('Load failed: '+(r&&r.error?r.error:'unknown'),'err'); return; }
 
-    if (!r || !r.success) {
-      _setStatus('error', 'Error');
-      _toast('Load failed: ' + (r && r.error ? r.error : 'unknown'), 'err');
-      return;
-    }
+    _D.orders         = r.orders         || [];
+    _D.orderDetails   = r.orderDetails   || [];
+    _D.receivedItems  = r.receivedItems  || [];
+    _D.returnedItems  = r.returnedItems  || [];
+    _D.pdfs           = r.pdfs           || [];
+    _D.indents        = r.indents        || [];
+    _D.purchasedItems = r.purchasedItems || [];
+    _D.reimbursements = r.reimbursements || [];
+    _D.dumpItems      = r.dumpItems      || [];
+    _D.masters        = r.masters        || {customers:[],locations:[],items:[],vendors:[]};
+    _D.lastTs         = r.ts || '';
 
-    _D.orders         = r.orders          || [];
-    _D.orderDetails   = r.orderDetails    || [];
-    _D.receivedItems  = r.receivedItems   || [];
-    _D.returnedItems  = r.returnedItems   || [];
-    _D.pdfs           = r.pdfs            || [];
-    _D.indents        = r.indents         || [];
-    _D.purchasedItems = r.purchasedItems  || [];
-    _D.reimbursements = r.reimbursements  || [];
-    _D.dumpItems      = r.dumpItems       || [];
-    _D.lastTs         = r.ts || new Date().toISOString();
+    // Build fast lookup maps
+    _D.masters.customers.forEach(function(c){ _M.cust[c.uid]=c.name; });
+    _D.masters.locations.forEach(function(l){ _M.loc[l.uid]={name:l.name,custUID:l.custUID}; });
+    _D.masters.items.forEach(function(i){ _M.item[i.uid]=i; });
+    _D.masters.vendors.forEach(function(v){ _M.vend[v.uid]=v.name; });
 
-    var ts = _D.lastTs ? _D.lastTs.substring(11, 16) : '?';
-    _setStatus('loaded', '✓ ' + ts);
-    _toast('✓ ' + _D.orders.length + ' orders loaded', 'ok');
-    _switchView(_currentView);
-    _startAutoRefresh();
+    var ts = _D.lastTs ? _D.lastTs.substring(11,16) : '';
+    setBadge('ok','✓ '+_D.orders.length+' orders · '+ts);
+    var sbts=document.getElementById('sb-last-ts'); if(sbts) sbts.textContent='Updated '+ts;
+    var sbk=document.getElementById('sb-badge-kanban'); if(sbk) sbk.textContent=_D.orders.length;
 
-  }, function(e) {
-    if (btn) btn.classList.remove('spinning');
-    _hideOverlay();
-    _setStatus('error', 'Failed');
-    _toast('API Error: ' + e.message, 'err');
+    toast('✓ '+_D.orders.length+' orders, '+_D.masters.customers.length+' customers loaded','ok');
+    switchView(_view, true);
+    _startAuto();
+  }, function(e){
+    if(ico) ico.classList.remove('spinning');
+    hideLoader(); setBadge('error','Failed'); toast('API Error: '+e.message,'err');
   });
 }
 
-function _startAutoRefresh() {
-  if (_autoRefTimer) clearInterval(_autoRefTimer);
-  if (!APP_CONFIG.autoRefreshMs) return;
-  _autoRefTimer = setInterval(function() {
-    _loadAll(true);
-  }, APP_CONFIG.autoRefreshMs);
+function _startAuto() {
+  if(_autoT) clearInterval(_autoT);
+  if(!APP_CONFIG.autoRefreshMs) return;
+  _autoT=setInterval(function(){ loadAll(true); }, APP_CONFIG.autoRefreshMs);
 }
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 3 — VIEW SWITCHER
-// ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  3. VIEW SWITCHER
+// ═══════════════════════════════════════════════════════════
+var VIEW_NAMES = {
+  kanban:'Kanban Board', table:'Orders Table', list:'Feed / List',
+  chart:'Charts & KPIs', calendar:'Calendar', timeline:'Order Timeline',
+  gallery:'Photo Gallery', pivot:'Pivot Table', map:'Location Map',
+  tree:'Customer Tree', purchase:'Purchase / Indent'
+};
 
-function _switchView(name) {
-  _currentView = name;
+function switchView(name, skipReset) {
+  _view=name; if(!skipReset) _tblPage=1;
+  document.querySelectorAll('.sb-nav-item').forEach(function(el){ el.classList.toggle('active', el.dataset.view===name); });
+  document.querySelectorAll('#view-tabs .vtab').forEach(function(el){ el.classList.toggle('active', el.dataset.view===name); });
+  var at=document.querySelector('#view-tabs .vtab.active'); if(at) at.scrollIntoView({block:'nearest',inline:'center',behavior:'smooth'});
+  var tb=document.getElementById('tb-view-name'); if(tb) tb.textContent=VIEW_NAMES[name]||name;
+  Object.keys(_charts).forEach(function(k){ try{_charts[k].destroy();}catch(e){} delete _charts[k]; });
 
-  // Update tabs
-  var tabs = document.querySelectorAll('.view-tab');
-  tabs.forEach(function(t) {
-    t.classList.toggle('active', t.dataset.view === name);
-  });
-
-  // Scroll active tab into view
-  var activeTab = document.querySelector('.view-tab.active');
-  if (activeTab) activeTab.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
-
-  // Destroy old charts
-  Object.keys(_chartInstances).forEach(function(k) {
-    try { _chartInstances[k].destroy(); } catch(e) {}
-    delete _chartInstances[k];
-  });
-
-  var vc = document.getElementById('view-container');
-  if (!vc) return;
-
-  if (!_D.orders.length && name !== 'chart' && name !== 'purchase') {
-    vc.innerHTML = '<div class="empty-state"><div class="empty-icon">📡</div><p>No data yet. Pull to refresh.</p></div>';
+  var c=document.getElementById('content'); if(!c) return;
+  if (!_D.orders.length && name!=='purchase') {
+    c.innerHTML = gasUrlNotSet()
+      ? '<div class="empty"><i class="fas fa-cog" style="font-size:48px;color:var(--teal)"></i><p>Setup Required</p><small>Set <code>GAS_URL</code> in <strong>apiconfig.js</strong> then push to GitHub.</small></div>'
+      : '<div class="empty"><i class="fas fa-satellite-dish"></i><p>No data loaded</p><small>Click Refresh to fetch data from Google Sheets.</small></div>';
     return;
   }
-
-  var renders = {
-    kanban:   _renderKanban,
-    table:    _renderTable,
-    chart:    _renderChart,
-    calendar: _renderCalendar,
-    timeline: _renderTimeline,
-    list:     _renderList,
-    gallery:  _renderGallery,
-    pivot:    _renderPivot,
-    map:      _renderMap,
-    tree:     _renderTree,
-    purchase: _renderPurchase
-  };
-
-  var fn = renders[name];
-  if (fn) fn();
-  else vc.innerHTML = '<div class="empty-state"><div class="empty-icon">🚧</div><p>View "' + name + '" not implemented.</p></div>';
+  var fn={kanban:renderKanban,table:renderTable,list:renderList,chart:renderChart,calendar:renderCalendar,timeline:renderTimeline,gallery:renderGallery,pivot:renderPivot,map:renderMap,tree:renderTree,purchase:renderPurchase}[name];
+  if(fn) fn(); else c.innerHTML='<div class="empty"><i class="fas fa-tools"></i><p>'+name+'</p></div>';
 }
+function gasUrlNotSet(){ return !GAS_URL||GAS_URL==='PASTE_YOUR_GAS_DEPLOYMENT_URL_HERE'; }
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 4 — HELPERS
-// ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  4. HELPERS
+// ═══════════════════════════════════════════════════════════
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function fmtDate(s)  { return s?String(s).substring(0,10):'—'; }
+function fmtDT(s)    { return s?String(s).substring(0,16).replace('T',' '):'—'; }
+function fmtNum(n)   { var v=parseFloat(n); return isNaN(v)?'—':v.toLocaleString('en-IN'); }
+function diffH(a,b)  { if(!a||!b) return null; return ((new Date(b)-new Date(a))/3600000).toFixed(1); }
+function today()     { return new Date().toISOString().substring(0,10); }
 
-function _esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+/* Resolved name accessors — use _customerName/_locationName if set by backend */
+function custName(o) { return o._customerName || _M.cust[String(o['Customer Name']||'').trim()] || o['Customer Name'] || o['Warehouse'] || '—'; }
+function locName(o)  { return o._locationName  || (_M.loc[String(o['Delivery Location']||'').trim()]&&_M.loc[String(o['Delivery Location']||'').trim()].name) || o['Delivery Location'] || o['Warehouse'] || '—'; }
+function itemName(r) { return r._itemName || _M.item[String(r['Item Name']||'').trim()]&&_M.item[String(r['Item Name']||'').trim()].name || r['Item Name'] || '—'; }
+function vendName(r) { return r._vendName || _M.vend[String(r['Vendor']||'').trim()] || r['Vendor'] || '—'; }
 
-function _statusPill(status) {
-  var cls = STATUS_CLASS[status] || 'pending';
-  return '<span class="status-pill ' + cls + '">' + _esc(status || 'Pending') + '</span>';
-}
+function uniq(arr,key){ var s={},r=[]; arr.forEach(function(x){ var v=String(x[key]||'').trim(); if(v&&!s[v]){s[v]=1;r.push(v);}}); return r.sort(); }
+function sBadge(s)   { return '<span class="badge '+(S_BADGE[s]||'badge-pending')+'">'+esc(s||'Pending')+'</span>'; }
+function photoSrc(p) { if(!p) return ''; if(p.startsWith('http')) return p; if(APP_CONFIG.drivePhotoBase) return APP_CONFIG.drivePhotoBase+'/'+p; return ''; }
 
-function _fmtDate(s) {
-  if (!s) return '—';
-  return String(s).substring(0, 10);
-}
-
-function _fmtDateTime(s) {
-  if (!s) return '—';
-  return String(s).substring(0, 16).replace('T', ' ');
-}
-
-function _fmtNum(n) {
-  var v = parseFloat(n);
-  return isNaN(v) ? '—' : v.toLocaleString('en-IN');
-}
-
-function _diffHours(a, b) {
-  if (!a || !b) return null;
-  var da = new Date(a), db = new Date(b);
-  return ((db - da) / 3600000).toFixed(1);
-}
-
-function _orderCustomer(o) {
-  var c = String(o['Customer Name'] || '').trim();
-  // UUIDs are from AppSheet refs — show OrderID prefix instead
-  if (c.length === 36 && c.indexOf('-') > 0) return o['Warehouse'] || o['OrderID'] || '—';
-  return c || o['Warehouse'] || '—';
-}
-
-function _orderLocation(o) {
-  var l = String(o['Delivery Location'] || '').trim();
-  if (l.length === 36 && l.indexOf('-') > 0) return o['Warehouse'] || '?';
-  return l || o['Warehouse'] || '?';
-}
-
-function _uniqueValues(arr, key) {
-  var seen = {}, out = [];
-  arr.forEach(function(r) {
-    var v = String(r[key] || '').trim();
-    if (v && !seen[v]) { seen[v] = 1; out.push(v); }
-  });
-  return out.sort();
-}
-
-// Filter orders based on current _tblFilter
-function _filteredOrders() {
-  return _D.orders.filter(function(o) {
-    if (_tblFilter.status && o._status !== _tblFilter.status) return false;
-    if (_tblFilter.wh && o['Warehouse'] !== _tblFilter.wh) return false;
-    if (_tblFilter.search) {
-      var q = _tblFilter.search.toLowerCase();
-      var hay = [o['OrderID'], _orderCustomer(o), o['Delivery Boy'],
-                 _orderLocation(o), o._status].join(' ').toLowerCase();
-      if (hay.indexOf(q) === -1) return false;
+/* Apply all active filters */
+function filtered() {
+  return _D.orders.filter(function(o){
+    if (_F.status    && o._status !== _F.status) return false;
+    if (_F.wh        && o['Warehouse'] !== _F.wh) return false;
+    if (_F.deliveryBoy && o['Delivery Boy'] !== _F.deliveryBoy) return false;
+    if (_F.customer  && custName(o) !== _F.customer) return false;
+    if (_F.location  && locName(o)  !== _F.location) return false;
+    if (_F.dateFrom  && fmtDate(o['Expected Delivery Date']) < _F.dateFrom) return false;
+    if (_F.dateTo    && fmtDate(o['Expected Delivery Date']) > _F.dateTo)   return false;
+    if (_F.hasCrates === 'yes' && !o['Crates Loaded']) return false;
+    if (_F.hasCrates === 'no'  &&  o['Crates Loaded']) return false;
+    if (_F.hasPhoto  === 'yes' && !o['Photo'])         return false;
+    if (_F.hasPhoto  === 'no'  &&  o['Photo'])         return false;
+    if (_F.invoiced  === 'yes' && !o['Invoice'])       return false;
+    if (_F.invoiced  === 'no'  &&  o['Invoice'])       return false;
+    if (_F.search) {
+      var q=_F.search.toLowerCase();
+      var h=[o['OrderID'],custName(o),locName(o),o['Delivery Boy'],o._status,o['Invoice']||'',o['Vehicle No.']||''].join(' ').toLowerCase();
+      if(h.indexOf(q)===-1) return false;
     }
     return true;
   });
 }
 
-// ── Chart.js default config ──────────────────────────────────
-function _chartDefaults() {
-  return {
-    color: '#94A3B8',
-    borderColor: 'rgba(255,255,255,0.06)',
-    plugins: {
-      legend: { labels: { color: '#94A3B8', font: { size: 11 } } },
-      tooltip: {
-        backgroundColor: '#152236',
-        borderColor: 'rgba(255,255,255,0.1)',
-        borderWidth: 1,
-        titleColor: '#E2E8F0',
-        bodyColor: '#94A3B8'
-      }
-    },
-    scales: {
-      x: { ticks: { color: '#64748B', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
-      y: { ticks: { color: '#64748B', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.06)' } }
-    }
-  };
-}
+/* Filter bar HTML */
+function filterBar(opts){
+  opts=opts||{};
+  var boys = uniq(_D.orders,'Delivery Boy');
+  var whs  = uniq(_D.orders,'Warehouse');
+  /* Build unique customer names from resolved field */
+  var custSet={},custList=[];
+  _D.orders.forEach(function(o){ var n=custName(o); if(n&&n!=='—'&&!custSet[n]){custSet[n]=1;custList.push(n);} });
+  custList.sort();
+  /* Build unique location names */
+  var locSet={},locList=[];
+  _D.orders.forEach(function(o){ var n=locName(o); if(n&&n!=='—'&&!locSet[n]){locSet[n]=1;locList.push(n);} });
+  locList.sort();
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 5 — VIEW: KANBAN
-// ────────────────────────────────────────────────────────────
+  var html='<div class="filter-bar-compact">';
 
-function _renderKanban() {
-  var vc = document.getElementById('view-container');
+  /* Search */
+  html+='<div class="fb-group" style="flex:3;min-width:220px"><div class="fb-label"><i class="fas fa-search" style="margin-right:3px"></i>Search</div>';
+  html+='<div style="position:relative"><i class="fas fa-search" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--sub);font-size:11px;pointer-events:none"></i>';
+  html+='<input class="form-input" style="padding-left:30px;height:34px;font-size:12px" type="search" placeholder="Order ID, customer, item, vehicle…" value="'+esc(_F.search)+'" oninput="_fs(\'search\',this.value)"></div></div>';
 
-  // Group orders by status
-  var groups = {};
-  KANBAN_COLS.forEach(function(c) { groups[c.key] = []; });
-  _D.orders.forEach(function(o) {
-    var s = o._status || 'Pending';
-    if (!groups[s]) groups[s] = [];
-    groups[s].push(o);
-  });
+  /* Status */
+  html+='<div class="fb-group"><div class="fb-label">Status</div><select class="form-input" onchange="_fs(\'status\',this.value)">';
+  html+='<option value="">All Status</option>';
+  ['Pending','WH Loaded','Delivered','DEO Collected','DEO Approved','Invoiced'].forEach(function(s){ html+='<option value="'+s+'"'+(_F.status===s?' selected':'')+'>'+s+'</option>'; });
+  html+='</select></div>';
 
-  var html = '<div id="view-kanban">';
-
-  KANBAN_COLS.forEach(function(col) {
-    var cards = groups[col.key] || [];
-    html += '<div class="kanban-col">';
-    html += '<div class="kanban-col-header" style="color:' + col.color + '">';
-    html += col.icon + ' ' + _esc(col.label);
-    html += '<span class="col-count">' + cards.length + '</span>';
-    html += '</div>';
-    html += '<div class="kanban-col-body">';
-
-    if (!cards.length) {
-      html += '<div style="padding:16px;text-align:center;font-size:11px;color:var(--text-dim)">No orders</div>';
-    } else {
-      // Show max 50 per column to keep DOM light
-      cards.slice(0, 50).forEach(function(o) {
-        var edd = _fmtDate(o['Expected Delivery Date']);
-        html += '<div class="kanban-card" onclick="_openDetail(\'' + _esc(o['OrderID']) + '\')">';
-        html += '<div class="kc-id">' + _esc(o['OrderID']) + '</div>';
-        html += '<div class="kc-customer">' + _esc(_orderCustomer(o)) + '</div>';
-        html += '<div class="kc-meta">';
-        html += '<span class="kc-chip">📅 ' + edd + '</span>';
-        if (o['Delivery Boy']) html += '<span class="kc-chip">🚴 ' + _esc(o['Delivery Boy']) + '</span>';
-        if (o['Crates Loaded']) html += '<span class="kc-chip">📦 ' + o['Crates Loaded'] + '</span>';
-        if (o['Warehouse']) html += '<span class="kc-chip">🏭 ' + _esc(o['Warehouse']) + '</span>';
-        html += '</div></div>';
-      });
-      if (cards.length > 50) {
-        html += '<div style="padding:8px;text-align:center;font-size:10px;color:var(--text-dim)">+' + (cards.length - 50) + ' more — use Table view</div>';
-      }
-    }
-
-    html += '</div></div>';
-  });
-
-  html += '</div>';
-  vc.innerHTML = html;
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 6 — VIEW: TABLE
-// ────────────────────────────────────────────────────────────
-
-function _renderTable() {
-  var vc   = document.getElementById('view-container');
-  var whs  = _uniqueValues(_D.orders, 'Warehouse');
-  var statuses = ['Pending','WH Loaded','Delivered','DEO Collected','DEO Approved','Invoiced'];
-
-  var html = '';
-
-  // Filter bar
-  html += '<div class="filter-bar">';
-  html += '<input id="tbl-search" type="search" placeholder="🔍 Search order, customer…" value="' + _esc(_tblFilter.search) + '" oninput="_tblSearch(this.value)" />';
-  html += '<select id="tbl-status" onchange="_tblFilterStatus(this.value)">';
-  html += '<option value="">All Status</option>';
-  statuses.forEach(function(s) {
-    html += '<option value="' + s + '"' + (_tblFilter.status === s ? ' selected' : '') + '>' + s + '</option>';
-  });
-  html += '</select>';
-  html += '<select id="tbl-wh" onchange="_tblFilterWH(this.value)">';
-  html += '<option value="">All WH</option>';
-  whs.forEach(function(w) {
-    html += '<option value="' + _esc(w) + '"' + (_tblFilter.wh === w ? ' selected' : '') + '>' + _esc(w) + '</option>';
-  });
-  html += '</select>';
-  html += '<button class="btn btn-sm" onclick="_exportCSV()">⬇ CSV</button>';
-  html += '</div>';
-
-  var rows = _filteredOrders();
-
-  // Sort
-  rows.sort(function(a, b) {
-    var av = String(a[_tblSort.col] || a._status || '');
-    var bv = String(b[_tblSort.col] || b._status || '');
-    return av < bv ? -_tblSort.dir : av > bv ? _tblSort.dir : 0;
-  });
-
-  html += '<div class="section-head"><h2>Orders</h2><span class="badge">' + rows.length + ' / ' + _D.orders.length + '</span></div>';
-  html += '<div class="table-wrap"><table><thead><tr>';
-
-  var cols = [
-    { key: 'OrderID',                label: 'Order ID' },
-    { key: 'Customer Name',          label: 'Customer' },
-    { key: 'Expected Delivery Date', label: 'Delivery Date' },
-    { key: 'Warehouse',              label: 'Warehouse' },
-    { key: 'Delivery Boy',           label: 'Delivery Boy' },
-    { key: 'Crates Loaded',          label: 'Crates' },
-    { key: 'Returned Crates',        label: 'Ret. Crates' },
-    { key: '_status',                label: 'Status' }
-  ];
-
-  cols.forEach(function(c) {
-    var sorted = _tblSort.col === c.key;
-    var dir    = sorted ? (_tblSort.dir === 1 ? '▲' : '▼') : '↕';
-    html += '<th class="' + (sorted ? 'sorted' : '') + '" onclick="_tblSortBy(\'' + c.key + '\')">';
-    html += _esc(c.label) + ' <span class="sort-icon">' + dir + '</span></th>';
-  });
-  html += '</tr></thead><tbody>';
-
-  if (!rows.length) {
-    html += '<tr><td colspan="' + cols.length + '" style="text-align:center;color:var(--text-dim);padding:24px">No matching orders</td></tr>';
-  } else {
-    rows.slice(0, 500).forEach(function(o) {
-      html += '<tr onclick="_openDetail(\'' + _esc(o['OrderID']) + '\')">';
-      html += '<td class="mono">' + _esc(o['OrderID']) + '</td>';
-      html += '<td>' + _esc(_orderCustomer(o)) + '</td>';
-      html += '<td>' + _fmtDate(o['Expected Delivery Date']) + '</td>';
-      html += '<td>' + _esc(o['Warehouse'] || '—') + '</td>';
-      html += '<td>' + _esc(o['Delivery Boy'] || '—') + '</td>';
-      html += '<td>' + _fmtNum(o['Crates Loaded']) + '</td>';
-      html += '<td>' + _fmtNum(o['Returned Crates']) + '</td>';
-      html += '<td>' + _statusPill(o._status) + '</td>';
-      html += '</tr>';
-    });
-    if (rows.length > 500) {
-      html += '<tr><td colspan="' + cols.length + '" style="text-align:center;color:var(--text-dim);padding:12px;font-size:11px">Showing 500 of ' + rows.length + '. Refine filters to see more.</td></tr>';
-    }
+  /* Customer — from resolved names */
+  if(custList.length){
+    html+='<div class="fb-group"><div class="fb-label">Customer</div><select class="form-input" onchange="_fs(\'customer\',this.value)">';
+    html+='<option value="">All</option>';
+    custList.slice(0,80).forEach(function(n){ html+='<option value="'+esc(n)+'"'+(_F.customer===n?' selected':'')+'>'+esc(n)+'</option>'; });
+    html+='</select></div>';
   }
 
-  html += '</tbody></table></div>';
-  vc.innerHTML = html;
-}
-
-function _tblSearch(v)        { _tblFilter.search = v; _renderTable(); }
-function _tblFilterStatus(v)  { _tblFilter.status = v; _renderTable(); }
-function _tblFilterWH(v)      { _tblFilter.wh     = v; _renderTable(); }
-function _tblSortBy(col) {
-  if (_tblSort.col === col) _tblSort.dir *= -1;
-  else { _tblSort.col = col; _tblSort.dir = 1; }
-  _renderTable();
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 7 — VIEW: CHART
-// ────────────────────────────────────────────────────────────
-
-function _renderChart() {
-  var vc = document.getElementById('view-container');
-
-  var html = '<div class="kpi-row" id="kpi-row"></div>';
-  html += '<div class="chart-grid">';
-  html += '<div class="chart-card"><h3>📦 Orders by Status</h3><canvas id="ch-status"></canvas></div>';
-  html += '<div class="chart-card"><h3>📅 Daily Order Volume (Last 14 Days)</h3><canvas id="ch-daily"></canvas></div>';
-  html += '<div class="chart-card"><h3>🛒 Indent vs Purchased (Top 15 Items)</h3><canvas id="ch-indent"></canvas></div>';
-  html += '<div class="chart-card"><h3>🚴 Delivery Boy Performance</h3><canvas id="ch-delivery"></canvas></div>';
-  html += '<div class="chart-card"><h3>📦 Crates Loaded vs Returned</h3><canvas id="ch-crates"></canvas></div>';
-  html += '<div class="chart-card"><h3>🏭 Orders by Warehouse</h3><canvas id="ch-warehouse"></canvas></div>';
-  html += '</div>';
-  vc.innerHTML = html;
-
-  // ── KPI Row ──────────────────────────────────────────────
-  var statusCount = {};
-  var cratesTotal = 0, cratesRet = 0;
-  _D.orders.forEach(function(o) {
-    var s = o._status || 'Pending';
-    statusCount[s] = (statusCount[s] || 0) + 1;
-    cratesTotal += parseFloat(o['Crates Loaded']   || 0);
-    cratesRet   += parseFloat(o['Returned Crates'] || 0);
-  });
-  var today = new Date().toISOString().substring(0, 10);
-  var todayOrders = _D.orders.filter(function(o) {
-    return String(o['Expected Delivery Date'] || '').substring(0, 10) === today;
-  }).length;
-
-  var kpiRow = document.getElementById('kpi-row');
-  if (kpiRow) {
-    kpiRow.innerHTML = [
-      { label: 'Total Orders', value: _D.orders.length,                     sub: 'all time',           cls: 'accent1' },
-      { label: "Today's",      value: todayOrders,                           sub: 'expected delivery',  cls: 'accent2' },
-      { label: 'Invoiced',     value: statusCount['Invoiced'] || 0,          sub: 'completed pipeline', cls: 'accent2' },
-      { label: 'Pending',      value: statusCount['Pending'] || 0,           sub: 'awaiting dispatch',  cls: 'accent3' },
-      { label: 'Crates Out',   value: Math.round(cratesTotal),               sub: 'total loaded',       cls: '' },
-      { label: 'Crates Back',  value: Math.round(cratesRet),                 sub: 'returned',           cls: 'accent4' },
-      { label: 'Indents',      value: _D.indents.length,                     sub: 'purchase indents',   cls: '' },
-      { label: 'Purchased',    value: _D.purchasedItems.length,              sub: 'line items bought',  cls: 'accent1' }
-    ].map(function(k) {
-      return '<div class="kpi-card ' + k.cls + '">' +
-        '<div class="kpi-label">' + k.label + '</div>' +
-        '<div class="kpi-value">' + k.value.toLocaleString('en-IN') + '</div>' +
-        '<div class="kpi-sub">'  + k.sub   + '</div></div>';
-    }).join('');
+  /* Location */
+  if(locList.length){
+    html+='<div class="fb-group"><div class="fb-label">Location</div><select class="form-input" onchange="_fs(\'location\',this.value)">';
+    html+='<option value="">All</option>';
+    locList.slice(0,80).forEach(function(n){ html+='<option value="'+esc(n)+'"'+(_F.location===n?' selected':'')+'>'+esc(n)+'</option>'; });
+    html+='</select></div>';
   }
 
-  var defs = _chartDefaults();
-
-  // ── Chart 1: Status Donut ────────────────────────────────
-  var statusLabels = Object.keys(statusCount);
-  var statusData   = statusLabels.map(function(k) { return statusCount[k]; });
-  var statusColors = ['#6366F1','#8B5CF6','#F59E0B','#10B981','#3B82F6','#06B6D4','#EF4444'];
-  _makeChart('ch-status', 'doughnut', {
-    labels:   statusLabels,
-    datasets: [{ data: statusData, backgroundColor: statusColors.slice(0, statusLabels.length), borderWidth: 0 }]
-  }, { plugins: { legend: defs.plugins.legend, tooltip: defs.plugins.tooltip } });
-
-  // ── Chart 2: Daily Volume (last 14 days) ────────────────
-  var dayMap = {};
-  _D.orders.forEach(function(o) {
-    var d = String(o['Expected Delivery Date'] || '').substring(0, 10);
-    if (d) dayMap[d] = (dayMap[d] || 0) + 1;
-  });
-  var allDays  = Object.keys(dayMap).sort().slice(-14);
-  var dailyVol = allDays.map(function(d) { return dayMap[d]; });
-  _makeChart('ch-daily', 'bar', {
-    labels:   allDays.map(function(d) { return d.substring(5); }),
-    datasets: [{ label: 'Orders', data: dailyVol,
-                 backgroundColor: 'rgba(59,130,246,0.7)',
-                 borderColor: '#3B82F6', borderWidth: 1, borderRadius: 4 }]
-  }, defs);
-
-  // ── Chart 3: Indent vs Purchased ────────────────────────
-  var itemMap = {};
-  _D.indents.forEach(function(r) {
-    var it = String(r['Item Name'] || '').trim().substring(0, 20);
-    if (!it) return;
-    if (!itemMap[it]) itemMap[it] = { indent: 0, purchased: 0 };
-    itemMap[it].indent += parseFloat(r['Qty'] || 0);
-  });
-  _D.purchasedItems.forEach(function(r) {
-    var it = String(r['Item Name'] || '').trim().substring(0, 20);
-    if (!it) return;
-    if (!itemMap[it]) itemMap[it] = { indent: 0, purchased: 0 };
-    itemMap[it].purchased += parseFloat(r['Qty'] || 0);
-  });
-  var itemKeys = Object.keys(itemMap).sort(function(a,b) {
-    return (itemMap[b].indent + itemMap[b].purchased) - (itemMap[a].indent + itemMap[a].purchased);
-  }).slice(0, 15);
-  _makeChart('ch-indent', 'bar', {
-    labels:   itemKeys,
-    datasets: [
-      { label: 'Indented',  data: itemKeys.map(function(k) { return itemMap[k].indent; }),
-        backgroundColor: 'rgba(99,102,241,0.7)', borderRadius: 3 },
-      { label: 'Purchased', data: itemKeys.map(function(k) { return itemMap[k].purchased; }),
-        backgroundColor: 'rgba(16,185,129,0.7)', borderRadius: 3 }
-    ]
-  }, Object.assign({}, defs, { indexAxis: 'y' }));
-
-  // ── Chart 4: Delivery Boy Performance ───────────────────
-  var dbMap = {};
-  _D.orders.forEach(function(o) {
-    var b = String(o['Delivery Boy'] || 'Unassigned').trim();
-    if (!dbMap[b]) dbMap[b] = { done: 0, pending: 0 };
-    var done = ['Invoiced','DEO Approved','DEO Collected','Delivered'].indexOf(o._status) >= 0;
-    if (done) dbMap[b].done++; else dbMap[b].pending++;
-  });
-  var dbKeys = Object.keys(dbMap);
-  _makeChart('ch-delivery', 'bar', {
-    labels:   dbKeys,
-    datasets: [
-      { label: 'Completed', data: dbKeys.map(function(k) { return dbMap[k].done; }),
-        backgroundColor: 'rgba(16,185,129,0.8)', borderRadius: 3 },
-      { label: 'Pending',   data: dbKeys.map(function(k) { return dbMap[k].pending; }),
-        backgroundColor: 'rgba(239,68,68,0.7)',  borderRadius: 3 }
-    ]
-  }, defs);
-
-  // ── Chart 5: Crates Loaded vs Returned by day ───────────
-  var crateMap = {};
-  _D.orders.forEach(function(o) {
-    var d = String(o['Expected Delivery Date'] || '').substring(0, 10);
-    if (!d) return;
-    if (!crateMap[d]) crateMap[d] = { loaded: 0, ret: 0 };
-    crateMap[d].loaded += parseFloat(o['Crates Loaded']   || 0);
-    crateMap[d].ret    += parseFloat(o['Returned Crates'] || 0);
-  });
-  var crateDays = Object.keys(crateMap).sort().slice(-10);
-  _makeChart('ch-crates', 'line', {
-    labels:   crateDays.map(function(d) { return d.substring(5); }),
-    datasets: [
-      { label: 'Loaded',   data: crateDays.map(function(d) { return crateMap[d].loaded; }),
-        borderColor: '#3B82F6', backgroundColor: 'rgba(59,130,246,0.1)',
-        fill: true, tension: 0.4, pointRadius: 3 },
-      { label: 'Returned', data: crateDays.map(function(d) { return crateMap[d].ret; }),
-        borderColor: '#10B981', backgroundColor: 'rgba(16,185,129,0.1)',
-        fill: true, tension: 0.4, pointRadius: 3 }
-    ]
-  }, defs);
-
-  // ── Chart 6: Orders by Warehouse ────────────────────────
-  var whMap = {};
-  _D.orders.forEach(function(o) {
-    var w = String(o['Warehouse'] || 'Unknown').trim();
-    whMap[w] = (whMap[w] || 0) + 1;
-  });
-  var whKeys = Object.keys(whMap);
-  _makeChart('ch-warehouse', 'pie', {
-    labels:   whKeys,
-    datasets: [{ data: whKeys.map(function(k) { return whMap[k]; }),
-                 backgroundColor: ['#3B82F6','#06B6D4','#8B5CF6','#F59E0B','#10B981'],
-                 borderWidth: 0 }]
-  }, { plugins: { legend: defs.plugins.legend, tooltip: defs.plugins.tooltip } });
-}
-
-function _makeChart(id, type, data, opts) {
-  var canvas = document.getElementById(id);
-  if (!canvas) return;
-  try {
-    _chartInstances[id] = new Chart(canvas, {
-      type: type,
-      data: data,
-      options: Object.assign({ responsive: true, maintainAspectRatio: true }, opts || {})
-    });
-  } catch(e) { console.warn('Chart error', id, e); }
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 8 — VIEW: CALENDAR
-// ────────────────────────────────────────────────────────────
-
-function _renderCalendar() {
-  var vc = document.getElementById('view-container');
-
-  // Build day map
-  var dayMap = {};
-  _D.orders.forEach(function(o) {
-    var d = String(o['Expected Delivery Date'] || '').substring(0, 10);
-    if (d) {
-      if (!dayMap[d]) dayMap[d] = [];
-      dayMap[d].push(o);
-    }
-  });
-
-  var today   = new Date();
-  var todayStr = today.toISOString().substring(0, 10);
-  var year    = _calYear;
-  var month   = _calMonth;
-  var months  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  var days    = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-
-  var firstDay  = new Date(year, month, 1).getDay();
-  var totalDays = new Date(year, month + 1, 0).getDate();
-
-  var html = '<div class="cal-header">';
-  html += '<button class="cal-nav-btn" onclick="_calPrev()">‹</button>';
-  html += '<span class="cal-title">' + months[month] + ' ' + year + '</span>';
-  html += '<button class="cal-nav-btn" onclick="_calNext()">›</button>';
-  html += '</div>';
-
-  html += '<div class="cal-grid">';
-  days.forEach(function(d) { html += '<div class="cal-day-name">' + d + '</div>'; });
-
-  // Empty cells before first day
-  for (var i = 0; i < firstDay; i++) { html += '<div class="cal-cell empty"></div>'; }
-
-  for (var d2 = 1; d2 <= totalDays; d2++) {
-    var dateStr = year + '-' + String(month + 1).padStart(2,'0') + '-' + String(d2).padStart(2,'0');
-    var orders  = dayMap[dateStr] || [];
-    var isToday = dateStr === todayStr;
-
-    html += '<div class="cal-cell' + (isToday ? ' today' : '') + '" onclick="_calDayClick(\'' + dateStr + '\')">';
-    html += '<div class="cal-day-num">' + d2 + '</div>';
-
-    if (orders.length) {
-      html += '<div class="cal-dots">';
-      if (orders.length <= 3) {
-        orders.forEach(function(o) {
-          var s = o._status || 'Pending';
-          var col = { Pending:'#6366F1', 'WH Loaded':'#8B5CF6', Delivered:'#F59E0B',
-                     'DEO Approved':'#10B981', Invoiced:'#06B6D4' }[s] || '#3B82F6';
-          html += '<div class="cal-dot" style="background:' + col + '" title="' + _esc(o['OrderID']) + '"></div>';
-        });
-      } else {
-        html += '<div class="cal-dot many" style="background:#3B82F6">' + orders.length + '</div>';
-      }
-      html += '</div>';
-    }
-    html += '</div>';
+  /* Delivery Boy */
+  if(boys.length){
+    html+='<div class="fb-group"><div class="fb-label">Delivery Boy</div><select class="form-input" onchange="_fs(\'deliveryBoy\',this.value)">';
+    html+='<option value="">All</option>';
+    boys.forEach(function(b){ html+='<option value="'+esc(b)+'"'+(_F.deliveryBoy===b?' selected':'')+'>'+esc(b)+'</option>'; });
+    html+='</select></div>';
   }
 
-  html += '</div>';
-
-  // Summary strip
-  var monthTotal = 0;
-  Object.keys(dayMap).forEach(function(d3) {
-    if (d3.substring(0, 7) === year + '-' + String(month + 1).padStart(2, '0')) {
-      monthTotal += dayMap[d3].length;
+  if(!opts.compact){
+    /* Warehouse */
+    if(whs.length){
+      html+='<div class="fb-group"><div class="fb-label">Warehouse</div><select class="form-input" onchange="_fs(\'wh\',this.value)">';
+      html+='<option value="">All</option>';
+      whs.forEach(function(w){ html+='<option value="'+esc(w)+'"'+(_F.wh===w?' selected':'')+'>'+esc(w)+'</option>'; });
+      html+='</select></div>';
     }
-  });
-  html += '<div style="text-align:center;margin-top:14px;font-size:12px;color:var(--muted)">' + monthTotal + ' orders in ' + months[month] + ' ' + year + '</div>';
-
-  vc.innerHTML = html;
-}
-
-function _calPrev() { _calMonth--; if (_calMonth < 0) { _calMonth = 11; _calYear--; } _renderCalendar(); }
-function _calNext() { _calMonth++; if (_calMonth > 11) { _calMonth = 0;  _calYear++; } _renderCalendar(); }
-function _calDayClick(dateStr) {
-  var orders = _D.orders.filter(function(o) {
-    return String(o['Expected Delivery Date'] || '').substring(0, 10) === dateStr;
-  });
-  if (!orders.length) { _toast('No orders on ' + dateStr); return; }
-  _showDayModal(dateStr, orders);
-}
-
-function _showDayModal(dateStr, orders) {
-  var html = '';
-  orders.forEach(function(o) {
-    html += '<div class="list-card" onclick="_openDetail(\'' + _esc(o['OrderID']) + '\')" style="margin-bottom:8px">';
-    html += '<div class="list-card-left">';
-    html += '<div class="list-card-id">' + _esc(o['OrderID']) + '</div>';
-    html += '<div class="list-card-customer">' + _esc(_orderCustomer(o)) + '</div>';
-    html += '</div>';
-    html += '<div class="list-card-right">' + _statusPill(o._status) + '</div>';
-    html += '</div>';
-  });
-  document.getElementById('modal-title').textContent = 'Orders — ' + dateStr + ' (' + orders.length + ')';
-  document.getElementById('modal-body').innerHTML = html;
-  _openModal();
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 9 — VIEW: TIMELINE
-// ────────────────────────────────────────────────────────────
-
-function _renderTimeline() {
-  var vc     = document.getElementById('view-container');
-  var order  = _timelineOID ? _D.orders.find(function(o) { return o['OrderID'] === _timelineOID; }) : _D.orders[0];
-  var orders = _D.orders;
-
-  var html = '<div class="filter-bar" style="margin-bottom:14px">';
-  html += '<select onchange="_timelineChange(this.value)" style="flex:1">';
-  html += '<option value="">— Select Order —</option>';
-  orders.slice(0, 200).forEach(function(o) {
-    var sel = (order && o['OrderID'] === order['OrderID']) ? ' selected' : '';
-    html += '<option value="' + _esc(o['OrderID']) + '"' + sel + '>' + _esc(o['OrderID']) + ' · ' + _esc(_orderCustomer(o)) + '</option>';
-  });
-  html += '</select></div>';
-
-  if (!order) {
-    html += '<div class="empty-state"><div class="empty-icon">⏱</div><p>Select an order above.</p></div>';
-    vc.innerHTML = html;
-    return;
+    /* Date range */
+    html+='<div class="fb-group"><div class="fb-label">EDD From</div><input class="form-input" type="date" value="'+esc(_F.dateFrom)+'" onchange="_fs(\'dateFrom\',this.value)"></div>';
+    html+='<div class="fb-group"><div class="fb-label">EDD To</div><input class="form-input" type="date" value="'+esc(_F.dateTo)+'" onchange="_fs(\'dateTo\',this.value)"></div>';
+    /* Photo */
+    html+='<div class="fb-group"><div class="fb-label">Loading Photo</div><select class="form-input" onchange="_fs(\'hasPhoto\',this.value)"><option value="">Any</option><option value="yes"'+(_F.hasPhoto==='yes'?' selected':'')+'>Has Photo</option><option value="no"'+(_F.hasPhoto==='no'?' selected':'')+'>No Photo</option></select></div>';
+    /* Invoice */
+    html+='<div class="fb-group"><div class="fb-label">Invoice</div><select class="form-input" onchange="_fs(\'invoiced\',this.value)"><option value="">Any</option><option value="yes"'+(_F.invoiced==='yes'?' selected':'')+'>Invoiced</option><option value="no"'+(_F.invoiced==='no'?' selected':'')+'>Not Invoiced</option></select></div>';
+    /* Crates */
+    html+='<div class="fb-group"><div class="fb-label">Crates</div><select class="form-input" onchange="_fs(\'hasCrates\',this.value)"><option value="">Any</option><option value="yes"'+(_F.hasCrates==='yes'?' selected':'')+'>Has Crates</option><option value="no"'+(_F.hasCrates==='no'?' selected':'')+'>No Crates</option></select></div>';
   }
 
-  var steps = [
-    { label: 'Order Created',            planned: order['Timestamp'],       actual: order['Timestamp'] },
-    { label: 'WH Loaded & Dispatched',   planned: order['_step1_planned'],  actual: order['_step1_actual'] },
-    { label: 'Delivered & Received',     planned: order['_step2_planned'],  actual: order['_step2_actual'] },
-    { label: 'Returns Collected by DEO', planned: order['_step4_planned'],  actual: order['_step4_actual'] },
-    { label: 'Approved by DEO',          planned: order['_step5_planned'],  actual: order['_step5_actual'] },
-    { label: 'Invoiced',                 planned: order['_step6_planned'],  actual: order['_step6_actual'] }
-  ];
+  html+='<div class="fb-group" style="flex:none"><div class="fb-label">&nbsp;</div><div style="display:flex;gap:6px"><button class="btn btn-secondary btn-sm" onclick="_clearF()"><i class="fas fa-times"></i> Clear</button></div></div>';
+  html+='</div>';
 
-  html += '<div class="kpi-card" style="margin-bottom:16px">';
-  html += '<div class="kpi-label">Order</div><div class="kpi-value" style="font-size:16px">' + _esc(order['OrderID']) + '</div>';
-  html += '<div class="kpi-sub">' + _esc(_orderCustomer(order)) + ' · ' + _statusPill(order._status) + '</div>';
-  html += '</div>';
-
-  html += '<div class="timeline-wrap">';
-
-  steps.forEach(function(step, idx) {
-    var done      = !!step.actual;
-    var dotClass  = done ? 'done' : 'pending';
-    var cardClass = done ? 'done' : '';
-    var delta     = null;
-    var deltaClass= '';
-
-    if (idx > 0 && steps[idx - 1].actual && step.actual) {
-      var h = _diffHours(steps[idx - 1].actual, step.actual);
-      if (h !== null) {
-        delta = parseFloat(h);
-        var planned_h = step.planned && steps[idx-1].planned ? _diffHours(steps[idx-1].planned, step.planned) : null;
-        if (planned_h !== null) {
-          deltaClass = delta > parseFloat(planned_h) ? 'late' : 'on-time';
-        }
-      }
-    }
-
-    html += '<div class="timeline-step">';
-    html += '<div class="timeline-dot ' + dotClass + '">' + (done ? '✓' : (idx + 1)) + '</div>';
-    html += '<div class="timeline-card ' + cardClass + '">';
-    html += '<div class="timeline-label">' + _esc(step.label) + '</div>';
-    html += '<div class="timeline-times">';
-
-    html += '<div class="timeline-time-item">';
-    html += '<span class="tt-label">Planned</span>';
-    html += '<span class="tt-val">' + _fmtDateTime(step.planned) + '</span>';
-    html += '</div>';
-
-    html += '<div class="timeline-time-item">';
-    html += '<span class="tt-label">Actual</span>';
-    html += '<span class="tt-val' + (done ? '' : ' late') + '">' + (done ? _fmtDateTime(step.actual) : 'Pending') + '</span>';
-    html += '</div>';
-
-    if (delta !== null) {
-      html += '<div class="timeline-time-item">';
-      html += '<span class="tt-label">Duration</span>';
-      html += '<span class="tt-val">' + delta + 'h</span>';
-      html += '</div>';
-    }
-
-    html += '</div>';
-
-    if (delta !== null) {
-      html += '<div class="timeline-delta ' + deltaClass + '">';
-      html += deltaClass === 'late' ? '⚠ Delayed by ' + delta + 'h from prev step' : '✓ On time (' + delta + 'h from prev step)';
-      html += '</div>';
-    }
-
-    html += '</div></div>';
-  });
-
-  html += '</div>';
-  vc.innerHTML = html;
-}
-
-function _timelineChange(oid) {
-  _timelineOID = oid;
-  _renderTimeline();
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 10 — VIEW: LIST
-// ────────────────────────────────────────────────────────────
-
-function _renderList() {
-  var vc  = document.getElementById('view-container');
-  var today = new Date().toISOString().substring(0, 10);
-
-  var html = '<div class="filter-bar">';
-  html += '<input type="search" placeholder="🔍 Quick search…" oninput="_listSearch(this.value)" />';
-  html += '</div>';
-
-  var orders = _filteredOrders().slice(0, 300);
-
-  // Group by delivery date
-  var groups = {};
-  orders.forEach(function(o) {
-    var d = String(o['Expected Delivery Date'] || '').substring(0, 10) || 'No Date';
-    if (!groups[d]) groups[d] = [];
-    groups[d].push(o);
-  });
-
-  var sortedDates = Object.keys(groups).sort().reverse();
-
-  html += '<div class="list-feed">';
-
-  sortedDates.forEach(function(date) {
-    var grp = groups[date];
-    var label = date === today ? '📅 Today — ' + date : date;
-    html += '<div class="section-head" style="margin-top:8px"><h2>' + label + '</h2><span class="badge">' + grp.length + '</span></div>';
-
-    grp.forEach(function(o) {
-      html += '<div class="list-card" onclick="_openDetail(\'' + _esc(o['OrderID']) + '\')">';
-      html += '<div class="list-card-left">';
-      html += '<div class="list-card-id">' + _esc(o['OrderID']) + '</div>';
-      html += '<div class="list-card-customer">' + _esc(_orderCustomer(o)) + '</div>';
-      html += '<div class="list-card-meta">';
-      if (o['Warehouse'])    html += '<span>🏭 ' + _esc(o['Warehouse']) + '</span>';
-      if (o['Delivery Boy']) html += '<span>🚴 ' + _esc(o['Delivery Boy']) + '</span>';
-      if (o['Crates Loaded']) html += '<span>📦 ' + o['Crates Loaded'] + ' crates</span>';
-      html += '</div></div>';
-      html += '<div class="list-card-right">' + _statusPill(o._status) + '</div>';
-      html += '</div>';
-    });
-  });
-
-  if (!orders.length) {
-    html += '<div class="empty-state"><div class="empty-icon">📝</div><p>No orders match.</p></div>';
+  /* Active filter chips */
+  var active=Object.keys(_F).filter(function(k){return _F[k];});
+  if(active.length){
+    html+='<div class="filter-row" style="margin-bottom:8px">';
+    active.forEach(function(k){ html+='<span class="fpill active teal">'+esc(k)+': '+esc(_F[k])+' <i class="fas fa-times" style="cursor:pointer;margin-left:4px" onclick="_fs(\''+k+'\',\'\')"></i></span>'; });
+    html+='</div>';
   }
-
-  html += '</div>';
-  vc.innerHTML = html;
-}
-
-function _listSearch(v) {
-  _tblFilter.search = v;
-  _renderList();
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 11 — VIEW: GALLERY
-// ────────────────────────────────────────────────────────────
-
-function _renderGallery() {
-  var vc = document.getElementById('view-container');
-
-  var html = '<div class="gallery-tabs">';
-  html += '<button class="gallery-tab-btn' + (_galleryMode === 'load' ? ' active' : '') + '" onclick="_galleryMode(\'load\')">📦 Loading Photos</button>';
-  html += '<button class="gallery-tab-btn' + (_galleryMode === 'receive' ? ' active' : '') + '" onclick="_galleryMode(\'receive\')">✅ Delivery Photos</button>';
-  html += '<button class="gallery-tab-btn' + (_galleryMode === 'pdfs' ? ' active' : '') + '" onclick="_galleryMode(\'pdfs\')">📄 Indent PDFs</button>';
-  html += '</div>';
-
-  if (_galleryMode === 'pdfs') {
-    html += _renderGalleryPDFs();
-  } else {
-    var photoKey = _galleryMode === 'load' ? 'Photo' : 'Receiving Photo';
-    var withPhoto = _D.orders.filter(function(o) { return !!o[photoKey]; });
-    var without   = _D.orders.filter(function(o) { return !o[photoKey]; });
-
-    html += '<div class="section-head"><h2>' + (photoKey === 'Photo' ? 'Loading' : 'Delivery') + ' Photos</h2>';
-    html += '<span class="badge">' + withPhoto.length + ' / ' + _D.orders.length + '</span></div>';
-
-    html += '<div class="gallery-grid">';
-    withPhoto.slice(0, 100).forEach(function(o) {
-      var p = String(o[photoKey] || '');
-      var src = _photoSrc(p);
-      html += '<div class="gallery-item" onclick="_galleryOpenPhoto(\'' + _esc(src) + '\',\'' + _esc(o['OrderID']) + '\')">';
-      if (src) {
-        html += '<img src="' + _esc(src) + '" alt="' + _esc(o['OrderID']) + '" loading="lazy" onerror="this.parentElement.innerHTML=\'<div class=gallery-placeholder><div class=ph-icon>🖼</div>' + _esc(o['OrderID']) + '</div>\'" />';
-      } else {
-        html += '<div class="gallery-placeholder"><div class="ph-icon">🖼</div><span>' + _esc(o['OrderID']) + '</span></div>';
-      }
-      html += '<div class="gallery-label">' + _esc(o['OrderID']) + '</div>';
-      html += '</div>';
-    });
-
-    // Placeholder tiles for orders without photos
-    without.slice(0, 20).forEach(function(o) {
-      html += '<div class="gallery-item" onclick="_openDetail(\'' + _esc(o['OrderID']) + '\')" style="opacity:0.4">';
-      html += '<div class="gallery-placeholder"><div class="ph-icon">📷</div><span style="font-size:8px">' + _esc(o['OrderID']) + '</span></div>';
-      html += '</div>';
-    });
-
-    html += '</div>';
-  }
-
-  vc.innerHTML = html;
-}
-
-function _renderGalleryPDFs() {
-  var html = '<div class="section-head"><h2>Indent PDFs</h2><span class="badge">' + _D.pdfs.length + '</span></div>';
-  if (!_D.pdfs.length) return html + '<div class="empty-state"><div class="empty-icon">📄</div><p>No PDFs found.</p></div>';
-
-  html += '<div style="display:flex;flex-direction:column;gap:8px">';
-  _D.pdfs.forEach(function(p) {
-    html += '<div class="list-card">';
-    html += '<div class="list-card-left">';
-    html += '<div class="list-card-id">📄 ' + _esc(p['PDF Name'] || '?') + '</div>';
-    html += '<div class="list-card-meta"><span>' + _fmtDate(p['Date']) + '</span></div>';
-    html += '</div>';
-    if (p['PDF Link']) {
-      html += '<div class="list-card-right"><a href="' + _esc(p['PDF Link']) + '" target="_blank" class="btn btn-sm btn-primary">Open</a></div>';
-    }
-    html += '</div>';
-  });
-  html += '</div>';
   return html;
 }
 
-window._galleryMode = function(m) {
-  _galleryMode = m;
-  _renderGallery();
-};
-
-function _photoSrc(p) {
-  if (!p) return '';
-  if (p.startsWith('http')) return p;
-  if (APP_CONFIG.drivePhotoBase) return APP_CONFIG.drivePhotoBase + '/' + p;
-  return '';   // path-only refs from AppSheet can't be resolved without base
-}
-
-window._galleryOpenPhoto = function(src, orderID) {
-  if (!src) { _openDetail(orderID); return; }
-  var mb = document.getElementById('modal-body');
-  mb.innerHTML = '<img src="' + _esc(src) + '" style="width:100%;border-radius:8px" />' +
-    '<div style="margin-top:10px;font-family:monospace;font-size:12px;color:var(--muted)">' + _esc(orderID) + '</div>';
-  document.getElementById('modal-title').textContent = 'Photo — ' + orderID;
-  _openModal();
-};
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 12 — VIEW: DETAIL (modal)
-// ────────────────────────────────────────────────────────────
-
-window._openDetail = function(orderID) {
-  var order = _D.orders.find(function(o) { return String(o['OrderID']).trim() === String(orderID).trim(); });
-  if (!order) { _toast('Order not found: ' + orderID, 'err'); return; }
-
-  var items    = _D.orderDetails.filter(function(r) { return String(r['OrderID']).trim() === String(orderID).trim(); });
-  var recItems = _D.receivedItems.filter(function(r) { return String(r['OrderID']).trim() === String(orderID).trim(); });
-  var retItems = _D.returnedItems.filter(function(r) { return String(r['OrderID']).trim() === String(orderID).trim(); });
-
-  document.getElementById('modal-title').textContent = orderID;
-
-  var html = '';
-
-  // ── Status banner ────────────────────────────────────────
-  html += '<div style="margin-bottom:16px;display:flex;align-items:center;gap:10px">';
-  html += _statusPill(order._status);
-  html += '<span style="font-size:11px;color:var(--muted)">EDD: ' + _fmtDate(order['Expected Delivery Date']) + '</span>';
-  html += '</div>';
-
-  // ── Key-value grid ───────────────────────────────────────
-  html += '<div class="detail-section">';
-  html += '<div class="detail-section-title">Order Info</div>';
-  html += '<div class="detail-kv-grid">';
-
-  var kvPairs = [
-    ['Order ID',       order['OrderID'],                     true],
-    ['Customer',       _orderCustomer(order),                false],
-    ['Location',       _orderLocation(order),                false],
-    ['Warehouse',      order['Warehouse'],                    false],
-    ['Delivery Boy',   order['Delivery Boy'],                 false],
-    ['Vehicle No.',    order['Vehicle No.'],                  false],
-    ['Crates Loaded',  order['Crates Loaded'],                false],
-    ['Ret. Crates',    order['Returned Crates'],              false],
-    ['Invoice No.',    order['Invoice'],                      true],
-    ['WH Status',      order['WH Status'],                    false]
-  ];
-
-  kvPairs.forEach(function(kv) {
-    html += '<div class="detail-kv">';
-    html += '<div class="dk-label">' + _esc(kv[0]) + '</div>';
-    html += '<div class="dk-val' + (kv[2] ? ' mono' : '') + '">' + _esc(kv[1] || '—') + '</div>';
-    html += '</div>';
-  });
-  html += '</div></div>';
-
-  // ── Order Items ──────────────────────────────────────────
-  html += '<div class="detail-section">';
-  html += '<div class="detail-section-title">Line Items (' + items.length + ')</div>';
-  if (items.length) {
-    html += '<table class="detail-items-table">';
-    html += '<thead><tr><th>#</th><th>Item Name</th><th>Qty</th><th>Recv.</th></tr></thead><tbody>';
-    items.forEach(function(it, idx) {
-      var recv = recItems.find(function(r) { return r['Item Name'] === it['Item Name']; });
-      html += '<tr>';
-      html += '<td style="color:var(--text-dim)">' + (idx + 1) + '</td>';
-      html += '<td>' + _esc(it['Item Name'] || '—') + '</td>';
-      html += '<td style="font-family:monospace;color:var(--accent);font-weight:700">' + _fmtNum(it['Qty']) + '</td>';
-      html += '<td style="font-family:monospace;color:var(--success)">' + (recv ? _fmtNum(recv['Qty']) : '—') + '</td>';
-      html += '</tr>';
-    });
-    html += '</tbody></table>';
-  } else {
-    html += '<p style="color:var(--text-dim);font-size:12px">No line items found in local cache.</p>';
-  }
-  html += '</div>';
-
-  // ── Returned Items ───────────────────────────────────────
-  if (retItems.length) {
-    html += '<div class="detail-section">';
-    html += '<div class="detail-section-title">Returned Items (' + retItems.length + ')</div>';
-    html += '<table class="detail-items-table"><thead><tr><th>Item</th><th>Qty</th></tr></thead><tbody>';
-    retItems.forEach(function(it) {
-      html += '<tr><td>' + _esc(it['Item Name'] || '—') + '</td>';
-      html += '<td style="font-family:monospace;color:var(--warning)">' + _fmtNum(it['Qty']) + '</td></tr>';
-    });
-    html += '</tbody></table></div>';
-  }
-
-  // ── Photos ───────────────────────────────────────────────
-  html += '<div class="detail-section">';
-  html += '<div class="detail-section-title">Photos</div>';
-  html += '<div class="detail-photos">';
-
-  var loadSrc = _photoSrc(order['Photo']);
-  var recvSrc = _photoSrc(order['Receiving Photo']);
-
-  html += '<div class="detail-photo-box">';
-  if (loadSrc) {
-    html += '<img src="' + _esc(loadSrc) + '" alt="Loading photo" onclick="_galleryOpenPhoto(\'' + _esc(loadSrc) + '\',\'' + _esc(order['OrderID']) + '\')" style="cursor:zoom-in" />';
-  } else {
-    html += '<div style="font-size:24px">📦</div><span>Loading Photo</span><span style="font-size:9px;margin-top:2px;color:var(--text-dim)">' + _esc(order['Photo'] || 'not uploaded') + '</span>';
-  }
-  html += '</div>';
-
-  html += '<div class="detail-photo-box">';
-  if (recvSrc) {
-    html += '<img src="' + _esc(recvSrc) + '" alt="Delivery photo" onclick="_galleryOpenPhoto(\'' + _esc(recvSrc) + '\',\'' + _esc(order['OrderID']) + '\')" style="cursor:zoom-in" />';
-  } else {
-    html += '<div style="font-size:24px">🚚</div><span>Delivery Photo</span><span style="font-size:9px;margin-top:2px;color:var(--text-dim)">' + _esc(order['Receiving Photo'] || 'not uploaded') + '</span>';
-  }
-  html += '</div>';
-
-  html += '</div></div>';
-
-  // ── Timeline mini ────────────────────────────────────────
-  html += '<div class="detail-section">';
-  html += '<div class="detail-section-title">Pipeline Steps</div>';
-  html += '<div class="timeline-wrap" style="padding-left:24px">';
-
-  var miniSteps = [
-    { label: 'Created',            ts: order['Timestamp']      },
-    { label: 'WH Loaded',          ts: order['_step1_actual']  },
-    { label: 'Received/Delivered',  ts: order['_step2_actual']  },
-    { label: 'Returns Collected',   ts: order['_step4_actual']  },
-    { label: 'DEO Approved',        ts: order['_step5_actual']  },
-    { label: 'Invoiced',            ts: order['_step6_actual']  }
-  ];
-
-  miniSteps.forEach(function(ms) {
-    var done = !!ms.ts;
-    html += '<div class="timeline-step">';
-    html += '<div class="timeline-dot ' + (done ? 'done' : 'pending') + '">' + (done ? '✓' : '·') + '</div>';
-    html += '<div style="font-size:12px;color:' + (done ? 'var(--text)' : 'var(--text-dim)') + '">';
-    html += _esc(ms.label) + (ms.ts ? ' <span style="color:var(--muted);font-size:10px;font-family:monospace">(' + _fmtDateTime(ms.ts) + ')</span>' : '');
-    html += '</div></div>';
-  });
-
-  html += '</div></div>';
-
-  // ── Invoice link ─────────────────────────────────────────
-  if (order['Invoice Link']) {
-    html += '<div class="detail-section">';
-    html += '<a href="' + _esc(order['Invoice Link']) + '" target="_blank" class="btn btn-primary" style="width:100%;justify-content:center">🧾 Open Invoice</a>';
-    html += '</div>';
-  }
-
-  // ── Remark ───────────────────────────────────────────────
-  if (order['Step4 Remark To Tally Items']) {
-    html += '<div class="detail-section">';
-    html += '<div class="detail-section-title">DEO Remark</div>';
-    html += '<div style="background:var(--bg-card2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;font-size:12px;color:var(--text)">' + _esc(order['Step4 Remark To Tally Items']) + '</div>';
-    html += '</div>';
-  }
-
-  document.getElementById('modal-body').innerHTML = html;
-  _openModal();
-};
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 13 — VIEW: PIVOT
-// ────────────────────────────────────────────────────────────
-
-function _renderPivot() {
-  var vc = document.getElementById('view-container');
-
-  var rowOptions = [
-    { key: 'Warehouse',    label: 'Warehouse' },
-    { key: 'Delivery Boy', label: 'Delivery Boy' },
-    { key: '_status',      label: 'Status' }
-  ];
-  var colOptions = [
-    { key: '_status',      label: 'Status' },
-    { key: 'Warehouse',    label: 'Warehouse' },
-    { key: 'Delivery Boy', label: 'Delivery Boy' }
-  ];
-
-  var html = '<div class="pivot-controls">';
-  html += '<select onchange="_pivotRowChange(this.value)">';
-  rowOptions.forEach(function(o) {
-    html += '<option value="' + o.key + '"' + (_pivotRow === o.key ? ' selected' : '') + '>Rows: ' + o.label + '</option>';
-  });
-  html += '</select>';
-  html += '<select onchange="_pivotColChange(this.value)">';
-  colOptions.forEach(function(o) {
-    html += '<option value="' + o.key + '"' + (_pivotCol === o.key ? ' selected' : '') + '>Cols: ' + o.label + '</option>';
-  });
-  html += '</select>';
-  html += '</div>';
-
-  // Build pivot
-  var rowVals = _uniqueValues(_D.orders, _pivotRow === '_status' ? '__status' : _pivotRow);
-  if (_pivotRow === '_status') rowVals = ['Pending','WH Loaded','Delivered','DEO Collected','DEO Approved','Invoiced'];
-  var colVals = _uniqueValues(_D.orders, _pivotCol === '_status' ? '__status' : _pivotCol);
-  if (_pivotCol === '_status') colVals = ['Pending','WH Loaded','Delivered','DEO Collected','DEO Approved','Invoiced'];
-
-  // Collect unique values properly
-  if (_pivotRow !== '_status') rowVals = _uniqueValues(_D.orders, _pivotRow);
-  if (_pivotCol !== '_status') colVals = _uniqueValues(_D.orders, _pivotCol);
-
-  var matrix = {};
-  var rowTotals = {};
-  var colTotals = {};
-  _D.orders.forEach(function(o) {
-    var rv = String(o[_pivotRow === '_status' ? '_status' : _pivotRow] || 'Unknown').trim();
-    var cv = String(o[_pivotCol === '_status' ? '_status' : _pivotCol] || 'Unknown').trim();
-    if (!matrix[rv]) matrix[rv] = {};
-    matrix[rv][cv] = (matrix[rv][cv] || 0) + 1;
-    rowTotals[rv]  = (rowTotals[rv]  || 0) + 1;
-    colTotals[cv]  = (colTotals[cv]  || 0) + 1;
-  });
-
-  // All rows that have data
-  var allRows = Object.keys(matrix).sort();
-  var allCols = Object.keys(colTotals).sort();
-
-  html += '<div class="pivot-table-wrap"><table class="pivot-table"><thead><tr>';
-  html += '<th style="min-width:120px">↓ ' + _pivotRow + ' / → ' + _pivotCol + '</th>';
-  allCols.forEach(function(c) { html += '<th>' + _esc(c) + '</th>'; });
-  html += '<th class="pivot-total">Total</th>';
-  html += '</tr></thead><tbody>';
-
-  allRows.forEach(function(rv) {
-    html += '<tr><td class="pivot-row-head">' + _esc(rv) + '</td>';
-    allCols.forEach(function(cv) {
-      var n = (matrix[rv] && matrix[rv][cv]) || 0;
-      html += '<td style="text-align:center;' + (n > 0 ? 'color:var(--text)' : 'color:var(--text-dim)') + '">' + (n || '—') + '</td>';
-    });
-    html += '<td class="pivot-total" style="text-align:center">' + (rowTotals[rv] || 0) + '</td>';
-    html += '</tr>';
-  });
-
-  // Col totals row
-  html += '<tr><td class="pivot-total">Total</td>';
-  allCols.forEach(function(c) { html += '<td class="pivot-total" style="text-align:center">' + (colTotals[c] || 0) + '</td>'; });
-  html += '<td class="pivot-total" style="text-align:center">' + _D.orders.length + '</td>';
-  html += '</tr>';
-
-  html += '</tbody></table></div>';
-
-  // Item-level pivot below
-  html += '<div style="margin-top:20px">';
-  html += '<div class="section-head"><h2>Top 20 Items by Indent Qty</h2></div>';
-
-  var itemTotals = {};
-  _D.indents.forEach(function(r) {
-    var it = String(r['Item Name'] || '').trim().substring(0, 30);
-    if (!it) return;
-    itemTotals[it] = (itemTotals[it] || 0) + parseFloat(r['Qty'] || 0);
-  });
-  var topItems = Object.keys(itemTotals).sort(function(a,b) { return itemTotals[b] - itemTotals[a]; }).slice(0, 20);
-
-  html += '<div class="pivot-table-wrap"><table class="pivot-table"><thead><tr><th>Item</th><th>Total Indent Qty</th></tr></thead><tbody>';
-  topItems.forEach(function(it) {
-    html += '<tr><td class="pivot-row-head">' + _esc(it) + '</td><td style="text-align:right">' + itemTotals[it].toLocaleString('en-IN') + '</td></tr>';
-  });
-  html += '</tbody></table></div></div>';
-
-  vc.innerHTML = html;
-}
-
-window._pivotRowChange = function(v) { _pivotRow = v; _renderPivot(); };
-window._pivotColChange = function(v) { _pivotCol = v; _renderPivot(); };
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 14 — VIEW: MAP
-// ────────────────────────────────────────────────────────────
-
-function _renderMap() {
-  var vc = document.getElementById('view-container');
-
-  // Group by warehouse (delivery location UUIDs can't be geocoded without a lookup table)
-  var whMap = {};
-  _D.orders.forEach(function(o) {
-    var w = String(o['Warehouse'] || 'Unknown').trim();
-    if (!whMap[w]) whMap[w] = { orders: [], statuses: {} };
-    whMap[w].orders.push(o);
-    var s = o._status || 'Pending';
-    whMap[w].statuses[s] = (whMap[w].statuses[s] || 0) + 1;
-  });
-
-  var html = '<div class="map-note">📍 Delivery locations are stored as AppSheet UUIDs. Showing warehouse groupings. For pin-map, add a "City" column to Orders sheet and share the updated URL.</div>';
-
-  html += '<div class="location-cards">';
-
-  Object.keys(whMap).forEach(function(wh) {
-    var data = whMap[wh];
-    var total = data.orders.length;
-    var inv   = data.statuses['Invoiced'] || 0;
-    var pct   = total ? Math.round((inv / total) * 100) : 0;
-
-    html += '<div class="location-card" onclick="_mapDrilldown(\'' + _esc(wh) + '\')">';
-    html += '<div class="loc-icon">🏭</div>';
-    html += '<div class="loc-name">' + _esc(wh) + '</div>';
-    html += '<div class="loc-count">' + total + ' orders · ' + pct + '% done</div>';
-
-    // Mini status breakdown
-    html += '<div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap">';
-    Object.keys(data.statuses).forEach(function(s) {
-      html += _statusPill(s) + ' <span style="font-size:9px;color:var(--text-dim)">' + data.statuses[s] + '</span> ';
-    });
-    html += '</div></div>';
-  });
-
-  html += '</div>';
-
-  // Reimbursement summary if any
-  if (_D.reimbursements.length) {
-    html += '<div style="margin-top:20px">';
-    html += '<div class="section-head"><h2>Reimbursements</h2><span class="badge">' + _D.reimbursements.length + '</span></div>';
-    html += '<div class="table-wrap"><table><thead><tr>';
-    html += '<th>Date</th><th>By</th><th>Category</th><th>Amount</th><th>Method</th></tr></thead><tbody>';
-    _D.reimbursements.slice(0, 50).forEach(function(r) {
-      html += '<tr>';
-      html += '<td>' + _fmtDate(r['Date']) + '</td>';
-      html += '<td>' + _esc(r['Expense By'] || '—') + '</td>';
-      html += '<td>' + _esc(r['Category'] || '—') + '</td>';
-      html += '<td style="font-family:monospace;color:var(--accent)">₹' + _fmtNum(r['Amount']) + '</td>';
-      html += '<td>' + _esc(r['Payment Method'] || '—') + '</td>';
-      html += '</tr>';
-    });
-    html += '</tbody></table></div></div>';
-  }
-
-  vc.innerHTML = html;
-}
-
-window._mapDrilldown = function(wh) {
-  var orders = _D.orders.filter(function(o) { return String(o['Warehouse'] || '').trim() === wh; });
-  _showDayModal(wh + ' — All Orders', orders);
-};
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 15 — VIEW: TREE
-// ────────────────────────────────────────────────────────────
-
-function _renderTree() {
-  var vc = document.getElementById('view-container');
-
-  // Build: Customer → Orders → Items
-  var customerMap = {};
-  _D.orders.forEach(function(o) {
-    var c = _orderCustomer(o);
-    if (!customerMap[c]) customerMap[c] = [];
-    customerMap[c].push(o);
-  });
-
-  // Build order→items lookup
-  var itemsMap = {};
-  _D.orderDetails.forEach(function(r) {
-    var oid = String(r['OrderID'] || '').trim();
-    if (!itemsMap[oid]) itemsMap[oid] = [];
-    itemsMap[oid].push(r);
-  });
-
-  var customers = Object.keys(customerMap).sort();
-
-  var html = '<div class="tree-root">';
-
-  customers.forEach(function(cust, ci) {
-    var orders    = customerMap[cust];
-    var nodeId    = 'cust-' + ci;
-    var totalQty  = 0;
-    orders.forEach(function(o) {
-      var its = itemsMap[o['OrderID']] || [];
-      its.forEach(function(it) { totalQty += parseFloat(it['Qty'] || 0); });
-    });
-
-    html += '<div class="tree-node" id="' + nodeId + '">';
-    html += '<div class="tree-node-header" onclick="_treeToggle(\'' + nodeId + '\')">';
-    html += '<span class="tree-chevron">▶</span>';
-    html += '<span class="tree-node-label">👤 ' + _esc(cust) + '</span>';
-    html += '<span class="tree-node-count">' + orders.length + ' orders</span>';
-    html += '</div>';
-    html += '<div class="tree-node-children">';
-
-    orders.slice(0, 30).forEach(function(o, oi) {
-      var orderNodeId = nodeId + '-o' + oi;
-      var its         = itemsMap[o['OrderID']] || [];
-
-      html += '<div class="tree-order-node" id="' + orderNodeId + '">';
-      html += '<div class="tree-order-header" onclick="_treeOrderToggle(\'' + orderNodeId + '\')">';
-      html += '<span class="tree-chevron">▶</span>';
-      html += '<span class="tree-order-id">' + _esc(o['OrderID']) + '</span>';
-      html += '<span style="margin-left:8px">' + _statusPill(o._status) + '</span>';
-      html += '<span class="tree-order-meta">' + its.length + ' items · ' + _fmtDate(o['Expected Delivery Date']) + '</span>';
-      html += '</div>';
-
-      html += '<div class="tree-order-items">';
-      if (its.length) {
-        its.forEach(function(it) {
-          html += '<div class="tree-item-row">';
-          html += '<span class="tree-item-name">' + _esc(it['Item Name'] || '—') + '</span>';
-          html += '<span class="tree-item-qty">' + _fmtNum(it['Qty']) + '</span>';
-          html += '</div>';
-        });
-      } else {
-        html += '<div style="font-size:11px;color:var(--text-dim)">No items in cache</div>';
-      }
-      html += '</div></div>';
-    });
-
-    if (orders.length > 30) {
-      html += '<div style="padding:8px;font-size:10px;color:var(--text-dim)">+' + (orders.length - 30) + ' more orders…</div>';
+window._fs=function(k,v){ _F[k]=v; _tblPage=1; var fn={table:renderTable,list:renderList,kanban:renderKanban}[_view]; if(fn)fn(); };
+window._clearF=function(){ Object.keys(_F).forEach(function(k){_F[k]='';_tblPage=1;}); switchView(_view); };
+
+// ═══════════════════════════════════════════════════════════
+//  5. KANBAN
+// ═══════════════════════════════════════════════════════════
+function renderKanban(){
+  var c=document.getElementById('content');
+  var rows=filtered();
+  var grp={}; KAN_COLS.forEach(function(col){grp[col.key]=[];});
+  rows.forEach(function(o){ var s=o._status||'Pending'; if(!grp[s])grp[s]=[]; grp[s].push(o); });
+
+  var html=filterBar({compact:true});
+  html+='<div id="kanban-board">';
+  KAN_COLS.forEach(function(col){
+    var cards=grp[col.key]||[];
+    html+='<div class="k-col">';
+    html+='<div class="k-col-head"><div class="k-col-dot" style="background:'+col.color+'"></div>';
+    html+='<i class="fas '+col.icon+'" style="color:'+col.color+';font-size:12px"></i>';
+    html+='<span style="color:'+col.color+'">'+esc(col.label)+'</span>';
+    html+='<span class="k-col-count">'+cards.length+'</span></div>';
+    html+='<div class="k-col-body scroll">';
+    if(!cards.length){
+      html+='<div style="padding:20px;text-align:center;font-size:11px;color:var(--sub)"><i class="fas fa-inbox" style="font-size:22px;display:block;margin-bottom:6px;opacity:.4"></i>No orders</div>';
+    } else {
+      cards.slice(0,40).forEach(function(o){
+        var edd=fmtDate(o['Expected Delivery Date']); var isT=edd===today();
+        html+='<div class="k-card" onclick="openDetail(\''+esc(o['OrderID'])+'\')">';
+        html+='<div class="k-card-id">'+esc(o['OrderID'])+'</div>';
+        html+='<div class="k-card-cust" title="'+esc(custName(o))+'">'+esc(custName(o))+'</div>';
+        html+='<div style="font-size:10px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(locName(o))+'">📍 '+esc(locName(o))+'</div>';
+        html+='<div class="k-card-meta">';
+        html+='<span class="k-chip"><i class="fas fa-calendar'+(isT?' style="color:var(--teal)"':'')+'"></i> '+edd+'</span>';
+        if(o['Delivery Boy'])  html+='<span class="k-chip"><i class="fas fa-motorcycle"></i> '+esc(o['Delivery Boy'])+'</span>';
+        if(o['Crates Loaded']) html+='<span class="k-chip"><i class="fas fa-box"></i> '+o['Crates Loaded']+'</span>';
+        if(o['Invoice'])       html+='<span class="k-chip" style="color:var(--teal)"><i class="fas fa-file-invoice"></i> INV</span>';
+        html+='</div></div>';
+      });
+      if(cards.length>40) html+='<div style="padding:8px;text-align:center;font-size:10px;color:var(--sub)">+' +(cards.length-40)+' more → Table view</div>';
     }
-
-    html += '</div></div>';
+    html+='</div></div>';
   });
-
-  html += '</div>';
-  vc.innerHTML = html;
+  html+='</div>';
+  c.innerHTML=html;
 }
 
-window._treeToggle = function(nodeId) {
-  var node = document.getElementById(nodeId);
-  if (node) node.classList.toggle('open');
-};
+// ═══════════════════════════════════════════════════════════
+//  6. TABLE
+// ═══════════════════════════════════════════════════════════
+var _tblSort={col:'Expected Delivery Date',dir:-1};
 
-window._treeOrderToggle = function(nodeId) {
-  var node = document.getElementById(nodeId);
-  if (node) node.classList.toggle('open');
-};
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 16 — VIEW: PURCHASE
-// ────────────────────────────────────────────────────────────
-
-function _renderPurchase() {
-  var vc = document.getElementById('view-container');
-
-  // Purchase KPIs
-  var totalSpend = 0;
-  _D.purchasedItems.forEach(function(r) {
-    totalSpend += (parseFloat(r['Qty'] || 0) * parseFloat(r['Rate'] || 0));
+function renderTable(){
+  var c=document.getElementById('content');
+  var rows=filtered();
+  rows.sort(function(a,b){
+    var av=String(a[_tblSort.col]||a._status||''), bv=String(b[_tblSort.col]||b._status||'');
+    return av<bv?-_tblSort.dir:av>bv?_tblSort.dir:0;
   });
+  var total=rows.length, start=(_tblPage-1)*_TBL_PER, pRows=rows.slice(start,start+_TBL_PER), tPages=Math.ceil(total/_TBL_PER)||1;
 
-  var vendorMap = {};
-  _D.purchasedItems.forEach(function(r) {
-    var v = String(r['Vendor'] || 'Unknown').trim();
-    if (!vendorMap[v]) vendorMap[v] = { qty: 0, spend: 0, items: 0 };
-    vendorMap[v].qty   += parseFloat(r['Qty']  || 0);
-    vendorMap[v].spend += parseFloat(r['Qty']  || 0) * parseFloat(r['Rate'] || 0);
-    vendorMap[v].items ++;
+  var cols=[
+    {key:'OrderID',               label:'Order ID'},
+    {key:'_customerName',         label:'Customer'},
+    {key:'_locationName',         label:'Delivery Location'},
+    {key:'Expected Delivery Date',label:'EDD'},
+    {key:'Delivery Boy',          label:'Del. Boy'},
+    {key:'Vehicle No.',           label:'Vehicle'},
+    {key:'Crates Loaded',         label:'Crates'},
+    {key:'Returned Crates',       label:'Ret.'},
+    {key:'Invoice',               label:'Invoice'},
+    {key:'_status',               label:'Status'}
+  ];
+
+  var html=filterBar({});
+  html+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">';
+  html+='<div style="font-size:12px;color:var(--muted)"><strong style="color:var(--text)">'+total+'</strong> orders · Showing '+(start+1)+'–'+Math.min(start+_TBL_PER,total)+'</div>';
+  html+='<button class="btn btn-secondary btn-sm" onclick="exportCSV()"><i class="fas fa-file-csv"></i> Export</button></div>';
+
+  html+='<div class="tbl-wrap"><table class="tbl"><thead><tr>';
+  cols.forEach(function(col){
+    var sorted=_tblSort.col===col.key;
+    html+='<th class="'+(sorted?'sorted':'')+'" onclick="_ts2(\''+col.key+'\')">'+esc(col.label)+'<span class="sort-ico">'+(sorted?(_tblSort.dir===1?'▲':'▼'):'↕')+'</span></th>';
   });
+  html+='<th></th></tr></thead><tbody>';
 
-  var html = '<div class="kpi-row">';
-  html += '<div class="kpi-card accent1"><div class="kpi-label">Total Indents</div><div class="kpi-value">' + _D.indents.length.toLocaleString('en-IN') + '</div><div class="kpi-sub">purchase lines</div></div>';
-  html += '<div class="kpi-card accent2"><div class="kpi-label">Purchased Items</div><div class="kpi-value">' + _D.purchasedItems.length.toLocaleString('en-IN') + '</div><div class="kpi-sub">line items</div></div>';
-  html += '<div class="kpi-card accent3"><div class="kpi-label">Est. Spend</div><div class="kpi-value" style="font-size:18px">₹' + Math.round(totalSpend).toLocaleString('en-IN') + '</div><div class="kpi-sub">qty × rate</div></div>';
-  html += '<div class="kpi-card"><div class="kpi-label">Vendors</div><div class="kpi-value">' + Object.keys(vendorMap).length + '</div><div class="kpi-sub">unique vendors</div></div>';
-  html += '</div>';
-
-  // Vendor breakdown table
-  html += '<div class="section-head"><h2>Vendor Spend Summary</h2></div>';
-  var vendors = Object.keys(vendorMap).sort(function(a,b) { return vendorMap[b].spend - vendorMap[a].spend; });
-  html += '<div class="table-wrap"><table><thead><tr><th>Vendor ID</th><th>Items Bought</th><th>Total Qty</th><th>Est. Spend (₹)</th></tr></thead><tbody>';
-  vendors.slice(0, 30).forEach(function(v) {
-    var vd = vendorMap[v];
-    html += '<tr>';
-    html += '<td class="mono">' + _esc(v) + '</td>';
-    html += '<td>' + vd.items + '</td>';
-    html += '<td style="font-family:monospace">' + vd.qty.toLocaleString('en-IN') + '</td>';
-    html += '<td style="font-family:monospace;color:var(--accent);font-weight:700">₹' + Math.round(vd.spend).toLocaleString('en-IN') + '</td>';
-    html += '</tr>';
-  });
-  html += '</tbody></table></div>';
-
-  // Recent Purchased Items
-  html += '<div class="section-head" style="margin-top:20px"><h2>Recent Purchases</h2><span class="badge">' + _D.purchasedItems.length + '</span></div>';
-  html += '<div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Indent ID</th><th>Item</th><th>Qty</th><th>Rate</th><th>Vendor</th></tr></thead><tbody>';
-  _D.purchasedItems.slice(0, 100).forEach(function(r) {
-    html += '<tr>';
-    html += '<td style="font-size:10px;font-family:monospace">' + _fmtDateTime(r['Timestamp']) + '</td>';
-    html += '<td class="mono">' + _esc(String(r['Indent_Id'] || '').substring(0, 20)) + '</td>';
-    html += '<td>' + _esc(String(r['Item Name'] || '').substring(0, 20)) + '</td>';
-    html += '<td style="text-align:right;font-family:monospace">' + _fmtNum(r['Qty']) + '</td>';
-    html += '<td style="text-align:right;font-family:monospace">₹' + _fmtNum(r['Rate']) + '</td>';
-    html += '<td class="mono">' + _esc(r['Vendor'] || '—') + '</td>';
-    html += '</tr>';
-  });
-  html += '</tbody></table></div>';
-
-  // Dump items if any
-  if (_D.dumpItems.length) {
-    html += '<div class="section-head" style="margin-top:20px"><h2>📦 Dump Entries</h2><span class="badge">' + _D.dumpItems.length + '</span></div>';
-    html += '<div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>User</th><th>Item</th><th>Qty</th><th>Reason</th></tr></thead><tbody>';
-    _D.dumpItems.forEach(function(r) {
-      html += '<tr>';
-      html += '<td style="font-size:10px">' + _fmtDateTime(r['Timestamp']) + '</td>';
-      html += '<td>' + _esc(r['Useremail'] || '—') + '</td>';
-      html += '<td>' + _esc(r['Item'] || '—') + '</td>';
-      html += '<td style="font-family:monospace">' + _fmtNum(r['Qty']) + '</td>';
-      html += '<td>' + _esc(r['Reason'] || '—') + '</td>';
-      html += '</tr>';
+  if(!pRows.length){
+    html+='<tr><td colspan="'+(cols.length+1)+'" style="text-align:center;padding:32px;color:var(--muted)"><i class="fas fa-inbox" style="font-size:22px;display:block;margin-bottom:8px;opacity:.4"></i>No matching orders</td></tr>';
+  } else {
+    pRows.forEach(function(o){
+      html+='<tr onclick="openDetail(\''+esc(o['OrderID'])+'\')">';
+      html+='<td class="mono">'+esc(o['OrderID'])+'</td>';
+      html+='<td>'+esc(custName(o))+'</td>';
+      html+='<td>'+esc(locName(o))+'</td>';
+      html+='<td>'+fmtDate(o['Expected Delivery Date'])+'</td>';
+      html+='<td>'+esc(o['Delivery Boy']||'—')+'</td>';
+      html+='<td style="font-family:monospace;font-size:11px">'+esc(o['Vehicle No.']||'—')+'</td>';
+      html+='<td class="num">'+fmtNum(o['Crates Loaded'])+'</td>';
+      html+='<td class="num">'+fmtNum(o['Returned Crates'])+'</td>';
+      html+='<td style="font-size:11px;font-family:monospace">'+esc(o['Invoice']||'—')+'</td>';
+      html+='<td>'+sBadge(o._status)+'</td>';
+      html+='<td onclick="event.stopPropagation()"><button class="act-btn ab-view" onclick="openDetail(\''+esc(o['OrderID'])+'\')" title="View Detail"><i class="fas fa-eye"></i></button></td>';
+      html+='</tr>';
     });
-    html += '</tbody></table></div>';
+  }
+  html+='</tbody></table>';
+  html+='<div class="pager"><div class="pager-info">'+total+' orders, page '+_tblPage+' of '+tPages+'</div>';
+  html+='<div class="pager-btns">';
+  html+='<button class="pager-btn" '+(_tblPage<=1?'disabled':'')+' onclick="_pg(1)"><i class="fas fa-angle-double-left"></i></button>';
+  html+='<button class="pager-btn" '+(_tblPage<=1?'disabled':'')+' onclick="_pg('+(_tblPage-1)+')"><i class="fas fa-angle-left"></i></button>';
+  html+='<span class="pager-page">'+_tblPage+' / '+tPages+'</span>';
+  html+='<button class="pager-btn" '+(_tblPage>=tPages?'disabled':'')+' onclick="_pg('+(_tblPage+1)+')"><i class="fas fa-angle-right"></i></button>';
+  html+='<button class="pager-btn" '+(_tblPage>=tPages?'disabled':'')+' onclick="_pg('+tPages+')"><i class="fas fa-angle-double-right"></i></button>';
+  html+='</div></div></div>';
+  c.innerHTML=html;
+}
+window._ts2=function(col){ if(_tblSort.col===col)_tblSort.dir*=-1; else{_tblSort.col=col;_tblSort.dir=1;} _tblPage=1; renderTable(); };
+window._pg=function(p){ _tblPage=p; renderTable(); };
+
+// ═══════════════════════════════════════════════════════════
+//  7. LIST
+// ═══════════════════════════════════════════════════════════
+function renderList(){
+  var c=document.getElementById('content');
+  var rows=filtered(); var todayStr=today();
+  var grp={}; rows.forEach(function(o){ var d=fmtDate(o['Expected Delivery Date'])||'No Date'; if(!grp[d])grp[d]=[]; grp[d].push(o); });
+  var dates=Object.keys(grp).sort().reverse();
+  var html=filterBar({compact:true});
+  html+='<div class="list-feed">';
+  dates.forEach(function(d){
+    var g=grp[d]; var isT=d===todayStr;
+    html+='<div class="sec-hd" style="margin-top:10px">';
+    html+='<h3>'+(isT?'<i class="fas fa-star" style="color:var(--teal)"></i> Today — ':'')+d+'</h3>';
+    html+='<span class="cnt">'+g.length+'</span><div class="line"></div></div>';
+    g.forEach(function(o){
+      html+='<div class="list-card" onclick="openDetail(\''+esc(o['OrderID'])+'\')">';
+      html+='<div class="list-card-left">';
+      html+='<div class="list-card-id">'+esc(o['OrderID'])+'</div>';
+      html+='<div class="list-card-cust">'+esc(custName(o))+'</div>';
+      html+='<div style="font-size:11px;color:var(--teal);margin-top:1px">📍 '+esc(locName(o))+'</div>';
+      html+='<div class="list-card-meta">';
+      if(o['Delivery Boy'])  html+='<span><i class="fas fa-motorcycle"></i> '+esc(o['Delivery Boy'])+'</span>';
+      if(o['Crates Loaded']) html+='<span><i class="fas fa-box"></i> '+o['Crates Loaded']+' crates</span>';
+      if(o['Vehicle No.'])   html+='<span><i class="fas fa-truck"></i> '+esc(o['Vehicle No.'])+'</span>';
+      if(o['Invoice'])       html+='<span style="color:var(--teal)"><i class="fas fa-file-invoice"></i> '+esc(o['Invoice'])+'</span>';
+      html+='</div></div>';
+      html+='<div class="list-card-right">'+sBadge(o._status)+'</div></div>';
+    });
+  });
+  if(!rows.length) html+='<div class="empty"><i class="fas fa-inbox"></i><p>No matching orders</p></div>';
+  html+='</div>';
+  c.innerHTML=html;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  8. CHART
+// ═══════════════════════════════════════════════════════════
+function renderChart(){
+  var c=document.getElementById('content');
+  var sc={},crT=0,crR=0,tod=0;
+  _D.orders.forEach(function(o){
+    var s=o._status||'Pending'; sc[s]=(sc[s]||0)+1;
+    crT+=parseFloat(o['Crates Loaded']||0); crR+=parseFloat(o['Returned Crates']||0);
+    if(fmtDate(o['Expected Delivery Date'])===today()) tod++;
+  });
+  var spend=0;
+  _D.purchasedItems.forEach(function(r){ spend+=parseFloat(r['Qty']||0)*parseFloat(r['Rate']||0); });
+
+  var kpis=[
+    {l:'Total Orders',v:_D.orders.length,s:'all time',cls:'sc-teal'},
+    {l:"Today's EDD",v:tod,s:'expected today',cls:'sc-green'},
+    {l:'Invoiced',v:sc['Invoiced']||0,s:'pipeline done',cls:'sc-blue'},
+    {l:'DEO Approved',v:sc['DEO Approved']||0,s:'approved',cls:'sc-cyan'},
+    {l:'Pending',v:sc['Pending']||0,s:'not dispatched',cls:'sc-amber'},
+    {l:'WH Loaded',v:sc['WH Loaded']||0,s:'en route',cls:'sc-purple'},
+    {l:'Crates Out',v:Math.round(crT),s:'total loaded',cls:'sc-slate'},
+    {l:'Crates Back',v:Math.round(crR),s:'returned',cls:'sc-red'},
+    {l:'Customers',v:_D.masters.customers.length,s:'master records',cls:'sc-teal'},
+    {l:'Locations',v:_D.masters.locations.length,s:'delivery points',cls:'sc-green'},
+    {l:'Items',v:_D.masters.items.length,s:'catalogue items',cls:'sc-blue'},
+    {l:'Est. Spend',v:'₹'+Math.round(spend/1000)+'K',s:'qty×rate',cls:'sc-amber',raw:true}
+  ];
+
+  var html='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:12px;margin-bottom:24px">';
+  kpis.forEach(function(k){
+    html+='<div class="stat-card '+k.cls+'"><div class="stat-label">'+k.l+'</div><div class="stat-val" style="font-size:'+(k.raw?'18':'24')+'px">'+(k.raw?k.v:typeof k.v==='number'?k.v.toLocaleString('en-IN'):k.v)+'</div><div class="stat-sub">'+k.s+'</div></div>';
+  });
+  html+='</div>';
+
+  html+='<div class="chart-grid">';
+  html+='<div class="chart-card"><h3><i class="fas fa-chart-pie" style="color:var(--teal);margin-right:5px"></i>Orders by Status</h3><canvas id="ch-s" height="220"></canvas></div>';
+  html+='<div class="chart-card"><h3><i class="fas fa-chart-bar" style="color:var(--blue);margin-right:5px"></i>Daily Volume (Last 14 Days)</h3><canvas id="ch-d" height="220"></canvas></div>';
+  html+='<div class="chart-card"><h3><i class="fas fa-boxes" style="color:var(--green);margin-right:5px"></i>Indent vs Purchased (Top 15 Items)</h3><canvas id="ch-i" height="220"></canvas></div>';
+  html+='<div class="chart-card"><h3><i class="fas fa-motorcycle" style="color:var(--amber);margin-right:5px"></i>Delivery Boy Performance</h3><canvas id="ch-b" height="220"></canvas></div>';
+  html+='<div class="chart-card"><h3><i class="fas fa-box" style="color:var(--purple);margin-right:5px"></i>Crates Loaded vs Returned</h3><canvas id="ch-c" height="220"></canvas></div>';
+  html+='<div class="chart-card"><h3><i class="fas fa-users" style="color:var(--cyan);margin-right:5px"></i>Top 10 Customers by Orders</h3><canvas id="ch-cust" height="220"></canvas></div>';
+  html+='</div>';
+  c.innerHTML=html;
+
+  var go={color:'#64748B',plugins:{legend:{labels:{color:'#64748B',font:{size:11,family:'Inter'}}},tooltip:{backgroundColor:'#1E293B',borderColor:'#334155',borderWidth:1,titleColor:'#F8FAFC',bodyColor:'#94A3B8',padding:10}},scales:{x:{ticks:{color:'#94A3B8',font:{size:10}},grid:{color:'rgba(0,0,0,.04)'}},y:{ticks:{color:'#94A3B8',font:{size:10}},grid:{color:'rgba(0,0,0,.06)'}}}};
+
+  /* Status donut */
+  var sl=Object.keys(sc), sc2=['#6366F1','#7C3AED','#F59E0B','#4285F4','#34A853','#06B6D4','#EA4335'];
+  mkChart('ch-s','doughnut',{labels:sl,datasets:[{data:sl.map(function(k){return sc[k];}),backgroundColor:sc2.slice(0,sl.length),borderWidth:0}]},{plugins:go.plugins,cutout:'65%'});
+
+  /* Daily bar */
+  var dm={}; _D.orders.forEach(function(o){ var d=fmtDate(o['Expected Delivery Date']); if(d)dm[d]=(dm[d]||0)+1; });
+  var dd=Object.keys(dm).sort().slice(-14);
+  mkChart('ch-d','bar',{labels:dd.map(function(d){return d.substring(5);}),datasets:[{label:'Orders',data:dd.map(function(d){return dm[d];}),backgroundColor:'rgba(14,124,134,.75)',borderColor:'#0E7C86',borderWidth:1,borderRadius:5}]},go);
+
+  /* Indent vs purchased — USE RESOLVED ITEM NAMES */
+  var im={};
+  _D.indents.forEach(function(r){ var n=itemName(r).substring(0,20); if(!n||n==='—')return; if(!im[n])im[n]={i:0,p:0}; im[n].i+=parseFloat(r['Qty']||0); });
+  _D.purchasedItems.forEach(function(r){ var n=itemName(r).substring(0,20); if(!n||n==='—')return; if(!im[n])im[n]={i:0,p:0}; im[n].p+=parseFloat(r['Qty']||0); });
+  var ik=Object.keys(im).sort(function(a,b){return(im[b].i+im[b].p)-(im[a].i+im[a].p);}).slice(0,15);
+  mkChart('ch-i','bar',{labels:ik,datasets:[{label:'Indented',data:ik.map(function(k){return im[k].i;}),backgroundColor:'rgba(99,102,241,.75)',borderRadius:3},{label:'Purchased',data:ik.map(function(k){return im[k].p;}),backgroundColor:'rgba(52,168,83,.75)',borderRadius:3}]},Object.assign({},go,{indexAxis:'y'}));
+
+  /* Delivery boy */
+  var bm={}; _D.orders.forEach(function(o){ var b=String(o['Delivery Boy']||'?').trim(); if(!bm[b])bm[b]={d:0,p:0}; if(['Invoiced','DEO Approved','DEO Collected','Delivered'].indexOf(o._status)>=0)bm[b].d++;else bm[b].p++; });
+  var bk=Object.keys(bm);
+  mkChart('ch-b','bar',{labels:bk,datasets:[{label:'Completed',data:bk.map(function(k){return bm[k].d;}),backgroundColor:'rgba(52,168,83,.8)',borderRadius:4},{label:'Pending',data:bk.map(function(k){return bm[k].p;}),backgroundColor:'rgba(234,67,53,.7)',borderRadius:4}]},go);
+
+  /* Crates */
+  var cm={}; _D.orders.forEach(function(o){ var d=fmtDate(o['Expected Delivery Date']); if(!d)return; if(!cm[d])cm[d]={l:0,r:0}; cm[d].l+=parseFloat(o['Crates Loaded']||0); cm[d].r+=parseFloat(o['Returned Crates']||0); });
+  var cd=Object.keys(cm).sort().slice(-14);
+  mkChart('ch-c','line',{labels:cd.map(function(d){return d.substring(5);}),datasets:[{label:'Loaded',data:cd.map(function(d){return cm[d].l;}),borderColor:'#0E7C86',backgroundColor:'rgba(14,124,134,.08)',fill:true,tension:.4,pointRadius:3},{label:'Returned',data:cd.map(function(d){return cm[d].r;}),borderColor:'#34A853',backgroundColor:'rgba(52,168,83,.08)',fill:true,tension:.4,pointRadius:3}]},go);
+
+  /* Top customers — USE RESOLVED NAMES */
+  var custM={};
+  _D.orders.forEach(function(o){ var n=custName(o); if(n&&n!=='—') custM[n]=(custM[n]||0)+1; });
+  var ck=Object.keys(custM).sort(function(a,b){return custM[b]-custM[a];}).slice(0,10);
+  mkChart('ch-cust','bar',{labels:ck.map(function(n){return n.length>18?n.substring(0,18)+'…':n;}),datasets:[{label:'Orders',data:ck.map(function(k){return custM[k];}),backgroundColor:'rgba(6,182,212,.75)',borderRadius:4}]},Object.assign({},go,{indexAxis:'y'}));
+}
+function mkChart(id,type,data,opts){
+  var el=document.getElementById(id); if(!el)return;
+  try{_charts[id]=new Chart(el,{type:type,data:data,options:Object.assign({responsive:true,maintainAspectRatio:false},opts||{})});}catch(e){console.warn('Chart',id,e);}
+}
+
+// ═══════════════════════════════════════════════════════════
+//  9. CALENDAR
+// ═══════════════════════════════════════════════════════════
+function renderCalendar(){
+  var c=document.getElementById('content');
+  var dm={}; _D.orders.forEach(function(o){ var d=fmtDate(o['Expected Delivery Date']); if(d){if(!dm[d])dm[d]=[];dm[d].push(o);} });
+  var todayStr=today(),months=['January','February','March','April','May','June','July','August','September','October','November','December'],days=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  var y=_calYear,m=_calMonth,fd=new Date(y,m,1).getDay(),tot=new Date(y,m+1,0).getDate();
+  var html='<div class="cal-nav"><button class="cal-nav-btn" onclick="calPrev()"><i class="fas fa-chevron-left"></i></button>';
+  html+='<div class="cal-month-label">'+months[m]+' '+y+'</div>';
+  html+='<button class="cal-nav-btn" onclick="calNext()"><i class="fas fa-chevron-right"></i></button></div>';
+  html+='<div class="cal-grid">';
+  days.forEach(function(d){html+='<div class="cal-day-name">'+d+'</div>';});
+  for(var i=0;i<fd;i++) html+='<div class="cal-cell empty"></div>';
+  for(var d2=1;d2<=tot;d2++){
+    var ds=y+'-'+String(m+1).padStart(2,'0')+'-'+String(d2).padStart(2,'0');
+    var ords=dm[ds]||[],isT=ds===todayStr;
+    html+='<div class="cal-cell'+(isT?' today':'')+'" onclick="calDay(\''+ds+'\')" title="'+ds+': '+ords.length+' orders">';
+    html+='<div class="cal-day-num">'+d2+'</div>';
+    if(ords.length){
+      html+='<div class="cal-dots">';
+      if(ords.length<=4){ords.forEach(function(o){var col={Pending:'#6366F1','WH Loaded':'#7C3AED',Delivered:'#F59E0B','DEO Approved':'#34A853',Invoiced:'#06B6D4'}[o._status]||'#4285F4';html+='<div class="cal-dot" style="background:'+col+'" title="'+esc(o['OrderID'])+'"></div>';});}
+      else html+='<div class="cal-dot-many" style="background:var(--teal)">'+ords.length+'</div>';
+      html+='</div>';
+    }
+    html+='</div>';
+  }
+  html+='</div>';
+  var mTot=0; Object.keys(dm).forEach(function(d){if(d.substring(0,7)===y+'-'+String(m+1).padStart(2,'0'))mTot+=dm[d].length;});
+  html+='<div style="text-align:center;margin-top:14px;font-size:12px;color:var(--muted)">'+mTot+' orders scheduled in '+months[m]+' '+y+'</div>';
+  c.innerHTML=html;
+}
+window.calPrev=function(){_calMonth--;if(_calMonth<0){_calMonth=11;_calYear--;}renderCalendar();};
+window.calNext=function(){_calMonth++;if(_calMonth>11){_calMonth=0;_calYear++;}renderCalendar();};
+window.calDay=function(ds){
+  var ords=_D.orders.filter(function(o){return fmtDate(o['Expected Delivery Date'])===ds;});
+  if(!ords.length){toast('No orders on '+ds);return;}
+  var html='<div style="display:flex;flex-direction:column;gap:8px">';
+  ords.forEach(function(o){html+='<div class="list-card" onclick="document.getElementById(\'day-modal\').classList.remove(\'show\');openDetail(\''+esc(o['OrderID'])+'\')"><div class="list-card-left"><div class="list-card-id">'+esc(o['OrderID'])+'</div><div class="list-card-cust">'+esc(custName(o))+'</div><div style="font-size:10px;color:var(--teal)">📍 '+esc(locName(o))+'</div></div><div class="list-card-right">'+sBadge(o._status)+'</div></div>';});
+  html+='</div>';
+  document.getElementById('day-modal-title').textContent='Orders — '+ds+' ('+ords.length+')';
+  document.getElementById('day-modal-body').innerHTML=html;
+  document.getElementById('day-modal').classList.add('show');
+};
+
+// ═══════════════════════════════════════════════════════════
+//  10. TIMELINE
+// ═══════════════════════════════════════════════════════════
+function renderTimeline(){
+  var c=document.getElementById('content');
+  var order=_tlOID?_D.orders.find(function(o){return o['OrderID']===_tlOID;}):_D.orders[0];
+  var html='<div style="margin-bottom:16px"><select class="form-input" style="max-width:480px" onchange="_tlSel(this.value)">';
+  html+='<option value="">— Select an order —</option>';
+  _D.orders.slice(0,300).forEach(function(o){html+='<option value="'+esc(o['OrderID'])+'"'+(order&&o['OrderID']===order['OrderID']?' selected':'')+'>'+esc(o['OrderID'])+' · '+esc(custName(o))+'</option>';});
+  html+='</select></div>';
+  if(!order){html+='<div class="empty"><i class="fas fa-stream"></i><p>Select an order above</p></div>';c.innerHTML=html;return;}
+
+  html+='<div class="card card-p" style="margin-bottom:20px"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+  html+='<div><div class="stat-label">Order</div><div style="font-size:16px;font-weight:800;color:var(--teal);font-family:monospace">'+esc(order['OrderID'])+'</div></div>';
+  html+='<div><div class="stat-label">Customer</div><div style="font-weight:600;font-size:13px">'+esc(custName(order))+'</div></div>';
+  html+='<div><div class="stat-label">Location</div><div style="font-weight:600;font-size:13px;color:var(--teal)">'+esc(locName(order))+'</div></div>';
+  html+='<div><div class="stat-label">EDD</div><div style="font-weight:600">'+fmtDate(order['Expected Delivery Date'])+'</div></div>';
+  html+='<div>'+sBadge(order._status)+'</div>';
+  if(order['Delivery Boy']) html+='<div><div class="stat-label">Del. Boy</div><div style="font-weight:600">'+esc(order['Delivery Boy'])+'</div></div>';
+  html+='</div></div>';
+
+  var steps=[
+    {label:'Order Created',           p:order['Timestamp'],      a:order['Timestamp']},
+    {label:'WH Loaded & Dispatched',  p:order['_step1_planned'], a:order['_step1_actual']},
+    {label:'Delivered & Received',    p:order['_step2_planned'], a:order['_step2_actual']},
+    {label:'Returns Collected by DEO',p:order['_step4_planned'], a:order['_step4_actual']},
+    {label:'Approved by DEO',         p:order['_step5_planned'], a:order['_step5_actual']},
+    {label:'Invoiced',                p:order['_step6_planned'], a:order['_step6_actual']}
+  ];
+  html+='<div class="tl-wrap">';
+  steps.forEach(function(step,idx){
+    var done=!!step.a,delta=null,dCls='';
+    if(idx>0&&steps[idx-1].a&&step.a){delta=parseFloat(diffH(steps[idx-1].a,step.a));dCls=delta>24?'late':'on-time';}
+    html+='<div class="tl-step">';
+    html+='<div class="tl-dot '+(done?(dCls==='late'?'late':'done'):'')+'">'+(done?'<i class="fas fa-check" style="font-size:7px"></i>':(idx+1))+'</div>';
+    html+='<div class="tl-card '+(done?(dCls==='late'?'late':'done'):'')+'">';
+    html+='<div class="tl-label">'+esc(step.label)+'</div>';
+    html+='<div class="tl-times">';
+    html+='<div class="tl-time-item"><div class="tl-time-label">Planned</div><div class="tl-time-val">'+fmtDT(step.p)+'</div></div>';
+    html+='<div class="tl-time-item"><div class="tl-time-label">Actual</div><div class="tl-time-val'+(done?'':' pending')+'">'+(done?fmtDT(step.a):'Pending…')+'</div></div>';
+    if(delta!==null) html+='<div class="tl-time-item"><div class="tl-time-label">Duration</div><div class="tl-time-val">'+delta+'h</div></div>';
+    html+='</div>';
+    if(delta!==null) html+='<div class="tl-delta '+dCls+'"><i class="fas fa-'+(dCls==='late'?'exclamation-triangle':'check')+'" style="margin-right:4px"></i>'+(dCls==='late'?'Delayed by '+delta+'h':'On time ('+delta+'h from prev step)')+'</div>';
+    html+='</div></div>';
+  });
+  html+='</div>';
+  c.innerHTML=html;
+}
+window._tlSel=function(oid){_tlOID=oid;renderTimeline();};
+
+// ═══════════════════════════════════════════════════════════
+//  11. GALLERY
+// ═══════════════════════════════════════════════════════════
+function renderGallery(){
+  var c=document.getElementById('content');
+  var html='<div class="gallery-tabs">';
+  html+='<button class="gal-tab'+(_galMode==='load'?' active':'')+'" onclick="_gm(\'load\')"><i class="fas fa-box" style="margin-right:5px"></i>Loading Photos</button>';
+  html+='<button class="gal-tab'+(_galMode==='recv'?' active':'')+'" onclick="_gm(\'recv\')"><i class="fas fa-check-circle" style="margin-right:5px"></i>Delivery Photos</button>';
+  html+='<button class="gal-tab'+(_galMode==='pdf'?' active':'')+'"  onclick="_gm(\'pdf\')" ><i class="fas fa-file-pdf" style="margin-right:5px"></i>Indent PDFs</button>';
+  html+='</div>';
+  if(_galMode==='pdf'){html+=galPDFs();c.innerHTML=html;return;}
+  var pKey=_galMode==='load'?'Photo':'Receiving Photo';
+  var withP=_D.orders.filter(function(o){return!!o[pKey];}),without=_D.orders.filter(function(o){return!o[pKey];});
+  html+='<div class="sec-hd"><h3>'+(_galMode==='load'?'Loading':'Delivery')+' Photos</h3><span class="cnt">'+withP.length+' / '+_D.orders.length+'</span><div class="line"></div></div>';
+  html+='<div class="gal-grid">';
+  withP.slice(0,120).forEach(function(o){
+    var src=photoSrc(o[pKey]);
+    html+='<div class="gal-item" onclick="_go(\''+esc(src)+'\',\''+esc(o['OrderID'])+'\')">';
+    if(src) html+='<img src="'+esc(src)+'" alt="'+esc(o['OrderID'])+'" loading="lazy" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'" />';
+    html+='<div class="gal-placeholder" style="'+(src?'display:none':'')+'" ><i class="fas fa-camera"></i><span>'+esc(o['OrderID'])+'</span></div>';
+    html+='<div class="gal-lbl">'+esc(custName(o).substring(0,18))+'</div></div>';
+  });
+  without.slice(0,30).forEach(function(o){
+    html+='<div class="gal-item" style="opacity:.3" onclick="openDetail(\''+esc(o['OrderID'])+'\')" title="No photo: '+esc(o['OrderID'])+'"><div class="gal-placeholder"><i class="fas fa-ban"></i><span style="font-size:8px">'+esc(o['OrderID'])+'</span></div></div>';
+  });
+  html+='</div>';
+  if(withP.length>120) html+='<div style="text-align:center;margin-top:12px;font-size:12px;color:var(--muted)">Showing 120 of '+withP.length+' photos</div>';
+  c.innerHTML=html;
+}
+function galPDFs(){
+  if(!_D.pdfs.length) return '<div class="empty"><i class="fas fa-file-pdf"></i><p>No PDFs found</p></div>';
+  var html='<div style="display:flex;flex-direction:column;gap:8px">';
+  _D.pdfs.forEach(function(p){html+='<div class="list-card"><div class="list-card-left"><div class="list-card-id"><i class="fas fa-file-pdf" style="color:var(--red);margin-right:4px"></i>'+esc(p['PDF Name']||'?')+'</div><div class="list-card-meta"><span><i class="fas fa-calendar"></i> '+fmtDate(p['Date'])+'</span></div></div>'+(p['PDF Link']?'<div class="list-card-right"><a href="'+esc(p['PDF Link'])+'" target="_blank" class="btn btn-primary btn-sm"><i class="fas fa-external-link-alt"></i> Open</a></div>':'')+'</div>';});
+  return html+'</div>';
+}
+window._gm=function(m){_galMode=m;renderGallery();};
+window._go=function(src,oid){
+  if(!src){openDetail(oid);return;}
+  document.getElementById('detail-title').textContent='Photo — '+oid;
+  document.getElementById('detail-sub').textContent='';
+  document.getElementById('detail-body').innerHTML='<img src="'+esc(src)+'" style="width:100%;border-radius:10px"/>';
+  document.getElementById('detail-invoice-btn').style.display='none';
+  document.getElementById('detail-overlay').classList.add('show');
+};
+
+// ═══════════════════════════════════════════════════════════
+//  12. ORDER DETAIL DRAWER
+// ═══════════════════════════════════════════════════════════
+window.openDetail=function(oid){
+  var order=_D.orders.find(function(o){return String(o['OrderID']).trim()===String(oid).trim();});
+  if(!order){toast('Order not found: '+oid,'err');return;}
+  var items   =_D.orderDetails.filter(function(r){return String(r['OrderID']).trim()===String(oid).trim();});
+  var recItems=_D.receivedItems.filter(function(r){return String(r['OrderID']).trim()===String(oid).trim();});
+  var retItems=_D.returnedItems.filter(function(r){return String(r['OrderID']).trim()===String(oid).trim();});
+
+  document.getElementById('detail-title').textContent=order['OrderID'];
+  document.getElementById('detail-sub').innerHTML=esc(custName(order))+' &nbsp;·&nbsp; '+sBadge(order._status);
+  _invLink=order['Invoice Link']||'';
+  document.getElementById('detail-invoice-btn').style.display=_invLink?'':'none';
+
+  var html='';
+
+  /* Header banner */
+  html+='<div class="info-box teal" style="margin-bottom:16px">';
+  html+='<i class="fas fa-map-marker-alt"></i>';
+  html+='<div><strong>'+esc(locName(order))+'</strong><div style="font-size:11px;margin-top:2px">'+esc(custName(order))+'</div></div></div>';
+
+  /* Order KVs */
+  html+='<div class="sec-hd"><h3>Order Info</h3><div class="line"></div></div>';
+  html+='<div class="kv-grid">';
+  [
+    ['Order ID',      order['OrderID'],                    true ],
+    ['Customer',      custName(order),                     false],
+    ['Location',      locName(order),                      false],
+    ['Warehouse',     order['Warehouse'],                   false],
+    ['EDD',           fmtDate(order['Expected Delivery Date']),false],
+    ['Delivery Boy',  order['Delivery Boy'],                false],
+    ['Vehicle No.',   order['Vehicle No.'],                 false],
+    ['Crates Loaded', order['Crates Loaded'],               false],
+    ['Ret. Crates',   order['Returned Crates'],             false],
+    ['Invoice No.',   order['Invoice'],                     true ],
+    ['WH Status',     order['WH Status'],                   false],
+    ['Email Status',  order['Email Status'],                false]
+  ].forEach(function(kv){
+    html+='<div class="kv-item"><div class="kv-label">'+esc(kv[0])+'</div><div class="kv-val'+(kv[2]?' mono':'')+'">'+esc(kv[1]||'—')+'</div></div>';
+  });
+  html+='</div>';
+
+  /* Line items with resolved names */
+  html+='<div class="sec-hd" style="margin-top:16px"><h3>Line Items</h3><span class="cnt">'+items.length+'</span><div class="line"></div></div>';
+  if(items.length){
+    html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>Item</th><th>Category</th><th>Unit</th><th class="num">Ordered</th><th class="num">Received</th></tr></thead><tbody>';
+    items.forEach(function(it,idx){
+      var rv=recItems.find(function(r){return r['Item Name']===it['Item Name'];});
+      var info=it._itemInfo||(_M.item[String(it['Item Name']||'').trim()])||{};
+      html+='<tr><td style="color:var(--sub)">'+(idx+1)+'</td>';
+      html+='<td><div style="font-weight:600">'+esc(itemName(it))+'</div><div style="font-size:9px;color:var(--sub);font-family:monospace">'+esc(it['Item Name']||'')+'</div></td>';
+      html+='<td><span class="badge" style="background:#F1F5F9;color:var(--slate);border:1px solid var(--border)">'+esc(info.cat||'—')+'</span></td>';
+      html+='<td style="color:var(--muted);font-size:11px">'+esc(info.unit||'—')+'</td>';
+      html+='<td class="num" style="color:var(--teal);font-weight:700">'+fmtNum(it['Qty'])+'</td>';
+      html+='<td class="num" style="color:var(--green)">'+(rv?fmtNum(rv['Qty']):'—')+'</td></tr>';
+    });
+    html+='</tbody></table></div>';
+  } else {
+    html+='<div class="empty" style="padding:20px"><i class="fas fa-inbox"></i><p style="font-size:12px">No items in local cache</p></div>';
   }
 
-  vc.innerHTML = html;
+  /* Returned items with names */
+  if(retItems.length){
+    html+='<div class="sec-hd" style="margin-top:14px"><h3>Returned Items</h3><span class="cnt">'+retItems.length+'</span><div class="line"></div></div>';
+    html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Item</th><th class="num">Qty</th></tr></thead><tbody>';
+    retItems.forEach(function(it){html+='<tr><td>'+esc(itemName(it))+'</td><td class="num" style="color:var(--amber-d)">'+fmtNum(it['Qty'])+'</td></tr>';});
+    html+='</tbody></table></div>';
+  }
+
+  /* Photos */
+  html+='<div class="sec-hd" style="margin-top:14px"><h3>Photos</h3><div class="line"></div></div>';
+  html+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">';
+  var lSrc=photoSrc(order['Photo']),rSrc=photoSrc(order['Receiving Photo']);
+  ['Loading','Delivery'].forEach(function(type){
+    var src=type==='Loading'?lSrc:rSrc;
+    var orig=type==='Loading'?order['Photo']:order['Receiving Photo'];
+    html+='<div style="aspect-ratio:4/3;background:#F8FAFC;border:1px solid var(--border);border-radius:10px;overflow:hidden;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;color:var(--sub)">';
+    if(src) html+='<img src="'+esc(src)+'" style="width:100%;height:100%;object-fit:cover;cursor:zoom-in" onclick="_go(\''+esc(src)+'\',\''+esc(order['OrderID'])+'\')" />';
+    else html+='<i class="fas fa-'+(type==='Loading'?'box':'truck')+'" style="font-size:22px"></i><span style="font-size:10px">'+type+' Photo</span><span style="font-size:9px;color:var(--sub)">'+esc(orig||'Not uploaded')+'</span>';
+    html+='</div>';
+  });
+  html+='</div>';
+
+  /* Mini timeline */
+  html+='<div class="sec-hd"><h3>Pipeline Steps</h3><div class="line"></div></div>';
+  html+='<div class="tl-wrap">';
+  [{l:'Created',t:order['Timestamp']},{l:'WH Loaded',t:order['_step1_actual']},{l:'Delivered',t:order['_step2_actual']},{l:'Returns Collected',t:order['_step4_actual']},{l:'DEO Approved',t:order['_step5_actual']},{l:'Invoiced',t:order['_step6_actual']}].forEach(function(s){
+    html+='<div class="tl-step"><div class="tl-dot '+(s.t?'done':'')+'">'+(s.t?'<i class="fas fa-check" style="font-size:7px"></i>':'·')+'</div>';
+    html+='<div style="font-size:12px;color:'+(s.t?'var(--text)':'var(--sub)')+';padding:4px 0">'+esc(s.l)+(s.t?' <span style="color:var(--muted);font-size:10px;font-family:monospace">('+fmtDT(s.t)+')</span>':'')+'</div></div>';
+  });
+  html+='</div>';
+
+  /* DEO Remark */
+  if(order['Step4 Remark To Tally Items']){
+    html+='<div class="sec-hd" style="margin-top:14px"><h3>DEO Remark</h3><div class="line"></div></div>';
+    html+='<div class="info-box teal"><i class="fas fa-info-circle"></i><div>'+esc(order['Step4 Remark To Tally Items'])+'</div></div>';
+  }
+
+  document.getElementById('detail-body').innerHTML=html;
+  document.getElementById('detail-overlay').classList.add('show');
+};
+window.closeDetail=function(){document.getElementById('detail-overlay').classList.remove('show');};
+window.openInvoice=function(){if(_invLink)window.open(_invLink,'_blank');};
+
+// ═══════════════════════════════════════════════════════════
+//  13. PIVOT
+// ═══════════════════════════════════════════════════════════
+function renderPivot(){
+  var c=document.getElementById('content');
+  var rOpts=[{k:'Customer',l:'Customer (resolved)'},{k:'Delivery Boy',l:'Delivery Boy'},{k:'_status',l:'Status'},{k:'Warehouse',l:'Warehouse'}];
+  var cOpts=[{k:'_status',l:'Status'},{k:'Customer',l:'Customer'},{k:'Delivery Boy',l:'Delivery Boy'},{k:'Warehouse',l:'Warehouse'}];
+  var html='<div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">';
+  html+='<div class="fb-group"><div class="fb-label">Rows</div><select class="form-input" onchange="_pR(this.value)">';
+  rOpts.forEach(function(o){html+='<option value="'+o.k+'"'+(_pivRow===o.k?' selected':'')+'>'+o.l+'</option>';});
+  html+='</select></div><div class="fb-group"><div class="fb-label">Columns</div><select class="form-input" onchange="_pC(this.value)">';
+  cOpts.forEach(function(o){html+='<option value="'+o.k+'"'+(_pivCol===o.k?' selected':'')+'>'+o.l+'</option>';});
+  html+='</select></div></div>';
+
+  /* Build matrix using RESOLVED customer names */
+  var mat={},rT={},cT={};
+  _D.orders.forEach(function(o){
+    var rv=(_pivRow==='Customer'?custName(o):String(o[_pivRow]||'Unknown')).trim()||'Unknown';
+    var cv=(_pivCol==='Customer'?custName(o):String(o[_pivCol]||'Unknown')).trim()||'Unknown';
+    if(!mat[rv])mat[rv]={};
+    mat[rv][cv]=(mat[rv][cv]||0)+1;
+    rT[rv]=(rT[rv]||0)+1;
+    cT[cv]=(cT[cv]||0)+1;
+  });
+  /* Sort rows by total desc */
+  var rows=Object.keys(mat).sort(function(a,b){return rT[b]-rT[a];}).slice(0,30);
+  var cols=Object.keys(cT).sort();
+
+  html+='<div class="pivot-wrap"><table class="pivot"><thead><tr><th>↓ '+esc(_pivRow)+' / → '+esc(_pivCol)+'</th>';
+  cols.forEach(function(col){html+='<th>'+esc(col)+'</th>';});
+  html+='<th class="pivot-total">Total</th></tr></thead><tbody>';
+  rows.forEach(function(rv){
+    html+='<tr><td class="pivot-row-head" title="'+esc(rv)+'">'+esc(rv.length>30?rv.substring(0,30)+'…':rv)+'</td>';
+    cols.forEach(function(cv){var n=(mat[rv]&&mat[rv][cv])||0;html+='<td class="num'+(n?'':' zero')+'">'+(n||'—')+'</td>';});
+    html+='<td class="num pivot-total">'+(rT[rv]||0)+'</td></tr>';
+  });
+  html+='<tr><td class="pivot-total">Total</td>';
+  cols.forEach(function(cv){html+='<td class="num pivot-total">'+(cT[cv]||0)+'</td>';});
+  html+='<td class="num pivot-total">'+_D.orders.length+'</td></tr>';
+  html+='</tbody></table></div>';
+  if(Object.keys(mat).length>30) html+='<div style="text-align:center;margin-top:8px;font-size:11px;color:var(--sub)">Showing top 30 rows of '+Object.keys(mat).length+'</div>';
+
+  /* Item pivot with resolved names */
+  var iMap={};
+  _D.indents.forEach(function(r){var n=itemName(r);if(!n||n==='—')return;iMap[n]=(iMap[n]||0)+parseFloat(r['Qty']||0);});
+  var iKeys=Object.keys(iMap).sort(function(a,b){return iMap[b]-iMap[a];}).slice(0,25);
+  html+='<div class="sec-hd" style="margin-top:20px"><h3>Top 25 Items by Indent Qty</h3><div class="line"></div></div>';
+  html+='<div class="pivot-wrap"><table class="pivot"><thead><tr><th>Item Name</th><th>Total Indent Qty</th></tr></thead><tbody>';
+  iKeys.forEach(function(it){html+='<tr><td class="pivot-row-head">'+esc(it)+'</td><td class="num">'+iMap[it].toLocaleString('en-IN')+'</td></tr>';});
+  html+='</tbody></table></div>';
+  c.innerHTML=html;
 }
+window._pR=function(v){_pivRow=v;renderPivot();};
+window._pC=function(v){_pivCol=v;renderPivot();};
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 17 — CSV EXPORT
-// ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  14. MAP / LOCATION
+// ═══════════════════════════════════════════════════════════
+function renderMap(){
+  var c=document.getElementById('content');
+  /* Group by resolved location name */
+  var lm={};
+  _D.orders.forEach(function(o){
+    var ln=locName(o)||'Unknown';
+    if(!lm[ln])lm[ln]={orders:[],sc:{}};
+    lm[ln].orders.push(o);
+    var s=o._status||'Pending'; lm[ln].sc[s]=(lm[ln].sc[s]||0)+1;
+  });
+  var locKeys=Object.keys(lm).sort(function(a,b){return lm[b].orders.length-lm[a].orders.length;});
 
-function _exportCSV() {
-  var rows = _filteredOrders();
-  var cols = ['OrderID','Customer Name','Expected Delivery Date','Warehouse',
-              'Delivery Boy','Vehicle No.','Crates Loaded','Returned Crates',
-              'WH Status','Email Status','Invoice','_status'];
+  var html='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px">';
+  html+='<div class="stat-card sc-teal"><div class="stat-label">Locations</div><div class="stat-val">'+locKeys.length+'</div><div class="stat-sub">delivery points</div></div>';
+  html+='<div class="stat-card sc-green"><div class="stat-label">Customers</div><div class="stat-val">'+_D.masters.customers.length+'</div><div class="stat-sub">master records</div></div>';
+  html+='<div class="stat-card sc-blue"><div class="stat-label">Orders</div><div class="stat-val">'+_D.orders.length+'</div><div class="stat-sub">total</div></div>';
+  html+='</div>';
 
-  var csv = cols.join(',') + '\n';
-  rows.forEach(function(o) {
-    csv += cols.map(function(c) {
-      var v = String(o[c] || '').replace(/"/g, '""');
-      return '"' + v + '"';
-    }).join(',') + '\n';
+  html+='<div class="loc-cards">';
+  locKeys.slice(0,60).forEach(function(ln){
+    var d=lm[ln];var total=d.orders.length;var inv=d.sc['Invoiced']||0;var pct=total?Math.round(inv/total*100):0;
+    html+='<div class="loc-card" onclick="_locDrill(\''+esc(ln)+'\')">';
+    html+='<div class="loc-icon"><i class="fas fa-map-marker-alt" style="color:var(--teal)"></i></div>';
+    html+='<div class="loc-name" title="'+esc(ln)+'">'+esc(ln.length>28?ln.substring(0,28)+'…':ln)+'</div>';
+    html+='<div class="loc-count">'+total+' orders</div>';
+    html+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:3px">';
+    Object.keys(d.sc).forEach(function(s){html+=sBadge(s)+'<span style="font-size:9px;color:var(--muted);margin-right:3px">'+d.sc[s]+'</span>';});
+    html+='</div>';
+    html+='<div class="loc-bar"><div class="loc-bar-fill" style="width:'+pct+'%"></div></div>';
+    html+='<div style="font-size:10px;color:var(--muted);margin-top:4px">'+pct+'% invoiced</div>';
+    html+='</div>';
+  });
+  html+='</div>';
+
+  /* Reimbursements */
+  if(_D.reimbursements.length){
+    html+='<div class="sec-hd" style="margin-top:24px"><h3>Reimbursements</h3><span class="cnt">'+_D.reimbursements.length+'</span><div class="line"></div></div>';
+    html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>By</th><th>Category</th><th>Method</th><th class="num">Amount</th></tr></thead><tbody>';
+    _D.reimbursements.slice(0,50).forEach(function(r){html+='<tr><td>'+fmtDate(r['Date'])+'</td><td>'+esc(r['Expense By']||'—')+'</td><td>'+esc(r['Category']||'—')+'</td><td>'+esc(r['Payment Method']||'—')+'</td><td class="num" style="color:var(--teal)">₹'+fmtNum(r['Amount'])+'</td></tr>';});
+    html+='</tbody></table></div>';
+  }
+  c.innerHTML=html;
+}
+window._locDrill=function(ln){
+  var ords=_D.orders.filter(function(o){return locName(o)===ln;});
+  var html='<div style="display:flex;flex-direction:column;gap:8px">';
+  ords.slice(0,60).forEach(function(o){html+='<div class="list-card" onclick="document.getElementById(\'day-modal\').classList.remove(\'show\');openDetail(\''+esc(o['OrderID'])+'\')"><div class="list-card-left"><div class="list-card-id">'+esc(o['OrderID'])+'</div><div class="list-card-cust">'+esc(custName(o))+'</div><div style="font-size:10px;color:var(--teal)">'+fmtDate(o['Expected Delivery Date'])+'</div></div><div class="list-card-right">'+sBadge(o._status)+'</div></div>';});
+  if(ords.length>60) html+='<div style="padding:8px;text-align:center;font-size:11px;color:var(--sub)">+' +(ords.length-60)+' more</div>';
+  html+='</div>';
+  document.getElementById('day-modal-title').textContent=ln+' ('+ords.length+')';
+  document.getElementById('day-modal-body').innerHTML=html;
+  document.getElementById('day-modal').classList.add('show');
+};
+
+// ═══════════════════════════════════════════════════════════
+//  15. TREE (Customer → Orders → Items, all resolved)
+// ═══════════════════════════════════════════════════════════
+function renderTree(){
+  var c=document.getElementById('content');
+  var cm={};
+  _D.orders.forEach(function(o){ var cu=custName(o); if(!cm[cu])cm[cu]=[]; cm[cu].push(o); });
+  var im={};
+  _D.orderDetails.forEach(function(r){ var oid=String(r['OrderID']||'').trim(); if(!im[oid])im[oid]=[]; im[oid].push(r); });
+
+  var html='<div class="filter-bar-compact" style="margin-bottom:14px"><div class="fb-group" style="flex:1"><div class="fb-label">Search Customer or Order</div><div style="position:relative"><i class="fas fa-search" style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--sub);font-size:11px;pointer-events:none"></i><input class="form-input" style="padding-left:30px;height:34px;font-size:12px" type="search" placeholder="Customer name, hotel, order ID…" oninput="_treeSrch(this.value)"></div></div></div>';
+  html+='<div class="tree-root" id="tree-root">';
+  Object.keys(cm).sort().forEach(function(cust,ci){
+    var ords=cm[cust],nid='tn-'+ci;
+    html+='<div class="tree-node" id="'+nid+'">';
+    html+='<div class="tree-node-head" onclick="treeT(\''+nid+'\')">';
+    html+='<i class="fas fa-chevron-right tree-chevron"></i>';
+    html+='<span class="tree-node-label"><i class="fas fa-building" style="color:var(--teal);margin-right:8px"></i>'+esc(cust)+'</span>';
+    html+='<span class="tree-node-count">'+ords.length+' orders</span></div>';
+    html+='<div class="tree-children">';
+    ords.slice(0,30).forEach(function(o,oi){
+      var onid=nid+'-o'+oi,its=im[o['OrderID']]||[];
+      html+='<div class="tree-order" id="'+onid+'">';
+      html+='<div class="tree-order-head" onclick="treeOT(\''+onid+'\')">';
+      html+='<i class="fas fa-chevron-right tree-chevron"></i>';
+      html+='<span class="tree-order-id">'+esc(o['OrderID'])+'</span>';
+      html+=sBadge(o._status);
+      html+='<span style="font-size:10px;color:var(--teal);margin-left:6px">📍 '+esc(locName(o).substring(0,20))+'</span>';
+      html+='<span class="tree-order-meta">'+its.length+' items · '+fmtDate(o['Expected Delivery Date'])+'</span>';
+      html+='<button class="btn btn-sm" style="padding:2px 8px;font-size:10px;margin-left:auto" onclick="event.stopPropagation();openDetail(\''+esc(o['OrderID'])+'\')"><i class="fas fa-eye"></i></button>';
+      html+='</div>';
+      html+='<div class="tree-order-items">';
+      if(its.length){its.forEach(function(it){
+        var info=it._itemInfo||(_M.item[String(it['Item Name']||'').trim()])||{};
+        html+='<div class="tree-item-row">';
+        html+='<span class="tree-item-name">'+esc(itemName(it))+'<span style="color:var(--sub);font-size:9px;margin-left:4px">['+esc(info.cat||'')+']</span></span>';
+        html+='<span style="color:var(--muted);font-size:9px;margin-right:8px">'+esc(info.unit||'')+'</span>';
+        html+='<span class="tree-item-qty">'+fmtNum(it['Qty'])+'</span></div>';
+      });}
+      else html+='<div style="font-size:11px;color:var(--sub);padding:4px">No items cached</div>';
+      html+='</div></div>';
+    });
+    if(ords.length>30) html+='<div style="padding:8px;font-size:10px;color:var(--sub)">+' +(ords.length-30)+' more orders…</div>';
+    html+='</div></div>';
+  });
+  html+='</div>';
+  c.innerHTML=html;
+}
+window.treeT=function(id){var n=document.getElementById(id);if(n)n.classList.toggle('open');};
+window.treeOT=function(id){var n=document.getElementById(id);if(n)n.classList.toggle('open');};
+window._treeSrch=function(q){
+  q=q.toLowerCase();
+  document.querySelectorAll('#tree-root .tree-node').forEach(function(node){
+    var txt=(node.querySelector('.tree-node-label')||{}).textContent||'';
+    var orderTxts=''; node.querySelectorAll('.tree-order-id').forEach(function(el){orderTxts+=el.textContent;});
+    node.style.display=(!q||txt.toLowerCase().indexOf(q)>=0||orderTxts.toLowerCase().indexOf(q)>=0)?'':'none';
+  });
+};
+
+// ═══════════════════════════════════════════════════════════
+//  16. PURCHASE (with resolved item & vendor names)
+// ═══════════════════════════════════════════════════════════
+function renderPurchase(){
+  var c=document.getElementById('content');
+  var spend=0; _D.purchasedItems.forEach(function(r){spend+=parseFloat(r['Qty']||0)*parseFloat(r['Rate']||0);});
+
+  /* Vendor aggregation using resolved names */
+  var vm={};
+  _D.purchasedItems.forEach(function(r){
+    var vn=vendName(r);
+    if(!vm[vn])vm[vn]={qty:0,spend:0,items:0};
+    vm[vn].qty+=parseFloat(r['Qty']||0);
+    vm[vn].spend+=parseFloat(r['Qty']||0)*parseFloat(r['Rate']||0);
+    vm[vn].items++;
   });
 
-  var blob = new Blob([csv], { type: 'text/csv' });
-  var url  = URL.createObjectURL(blob);
-  var a    = document.createElement('a');
-  a.href   = url;
-  a.download = 'o2d-orders-' + new Date().toISOString().substring(0, 10) + '.csv';
+  /* Item category breakdown */
+  var catM={Fruit:0,Veg:0,Other:0};
+  _D.indents.forEach(function(r){
+    var info=r._itemInfo||(_M.item[String(r['Item Name']||'').trim()])||{};
+    var cat=info.cat||'Other';
+    catM[cat]=(catM[cat]||0)+parseFloat(r['Qty']||0);
+  });
+
+  var html='<div class="purchase-summary">';
+  html+='<h2>Estimated Purchase Spend</h2>';
+  html+='<div class="big-num">₹'+Math.round(spend).toLocaleString('en-IN')+'</div>';
+  html+='<div class="ps-sub">'+_D.purchasedItems.length+' line items · '+Object.keys(vm).length+' vendors · '+_D.indents.length+' indents</div>';
+  html+='</div>';
+
+  html+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:20px">';
+  [{l:'Indents',v:_D.indents.length,cls:'sc-teal'},{l:'Purchased Lines',v:_D.purchasedItems.length,cls:'sc-green'},{l:'Active Vendors',v:Object.keys(vm).length,cls:'sc-blue'},{l:'Fruit Indent (KG)',v:Math.round(catM['Fruit']||0),cls:'sc-amber'},{l:'Veg Indent (KG)',v:Math.round(catM['Veg']||0),cls:'sc-green'},{l:'Dump Entries',v:_D.dumpItems.length,cls:'sc-red'}].forEach(function(k){
+    html+='<div class="stat-card '+k.cls+'"><div class="stat-label">'+k.l+'</div><div class="stat-val" style="font-size:20px">'+k.v.toLocaleString('en-IN')+'</div></div>';
+  });
+  html+='</div>';
+
+  /* Vendor spend table — resolved names */
+  var vk=Object.keys(vm).sort(function(a,b){return vm[b].spend-vm[a].spend;});
+  html+='<div class="sec-hd"><h3>Vendor Spend Summary</h3><span class="cnt">'+vk.length+'</span><div class="line"></div></div>';
+  html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Vendor Name</th><th class="num">Items Bought</th><th class="num">Total Qty</th><th class="num">Est. Spend (₹)</th></tr></thead><tbody>';
+  vk.slice(0,30).forEach(function(vn){html+='<tr><td style="font-weight:600">'+esc(vn)+'</td><td class="num">'+vm[vn].items+'</td><td class="num">'+vm[vn].qty.toLocaleString('en-IN')+'</td><td class="num" style="color:var(--teal);font-weight:700">₹'+Math.round(vm[vn].spend).toLocaleString('en-IN')+'</td></tr>';});
+  html+='</tbody></table></div>';
+
+  /* Recent purchases — resolved item + vendor names */
+  html+='<div class="sec-hd" style="margin-top:20px"><h3>Recent Purchases</h3><span class="cnt">'+_D.purchasedItems.length+'</span><div class="line"></div></div>';
+
+  /* Filters for purchase */
+  var cats=uniq(_D.masters.items,'cat'); var subs=uniq(_D.masters.items,'subcat');
+  html+='<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">';
+  html+='<select class="form-input" style="height:32px;font-size:12px" id="pur-cat" onchange="_purFilter()">';
+  html+='<option value="">All Categories</option>';
+  cats.forEach(function(ca){html+='<option>'+esc(ca)+'</option>';});
+  html+='</select>';
+  html+='<select class="form-input" style="height:32px;font-size:12px" id="pur-sub" onchange="_purFilter()">';
+  html+='<option value="">All Sub-Categories</option>';
+  subs.forEach(function(s){html+='<option>'+esc(s)+'</option>';});
+  html+='</select>';
+  html+='<input class="form-input" style="height:32px;font-size:12px;min-width:180px" type="search" id="pur-search" placeholder="Search item or vendor…" oninput="_purFilter()">';
+  html+='</div>';
+
+  html+='<div id="pur-table-wrap">';
+  html+=_purTable(_D.purchasedItems);
+  html+='</div>';
+
+  /* Indent table */
+  html+='<div class="sec-hd" style="margin-top:20px"><h3>Purchase Indents</h3><span class="cnt">'+_D.indents.length+'</span><div class="line"></div></div>';
+  html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Item Name</th><th>Category</th><th>Unit</th><th class="num">Qty</th><th>Indent Date</th></tr></thead><tbody>';
+  _D.indents.slice(0,100).forEach(function(r){
+    var info=r._itemInfo||(_M.item[String(r['Item Name']||'').trim()])||{};
+    html+='<tr><td><div style="font-weight:600">'+esc(itemName(r))+'</div></td>';
+    html+='<td><span class="badge" style="background:#F1F5F9;color:var(--slate);border:1px solid var(--border)">'+esc(info.cat||'—')+'</span></td>';
+    html+='<td style="color:var(--muted)">'+esc(info.unit||'—')+'</td>';
+    html+='<td class="num" style="color:var(--teal);font-weight:700">'+fmtNum(r['Qty'])+'</td>';
+    html+='<td>'+fmtDate(r['Timestamp'])+'</td></tr>';
+  });
+  html+='</tbody></table></div>';
+
+  /* Dump */
+  if(_D.dumpItems.length){
+    html+='<div class="sec-hd" style="margin-top:20px"><h3>Dump Entries</h3><span class="cnt">'+_D.dumpItems.length+'</span><div class="line"></div></div>';
+    html+='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Timestamp</th><th>User</th><th>Item</th><th class="num">Qty</th><th>Reason</th></tr></thead><tbody>';
+    _D.dumpItems.forEach(function(r){html+='<tr><td style="font-size:10px">'+fmtDT(r['Timestamp'])+'</td><td>'+esc(r['Useremail']||'—')+'</td><td>'+esc(r['Item']||'—')+'</td><td class="num">'+fmtNum(r['Qty'])+'</td><td>'+esc(r['Reason']||'—')+'</td></tr>';});
+    html+='</tbody></table></div>';
+  }
+  c.innerHTML=html;
+}
+
+function _purTable(data){
+  if(!data.length) return '<div class="empty"><i class="fas fa-inbox"></i><p>No items match</p></div>';
+  var html='<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Item Name</th><th>Category</th><th>Vendor</th><th class="num">Qty</th><th class="num">Rate</th><th class="num">Amount (₹)</th><th>Date</th></tr></thead><tbody>';
+  data.slice(0,150).forEach(function(r){
+    var info=r._itemInfo||(_M.item[String(r['Item Name']||'').trim()])||{};
+    var amt=parseFloat(r['Qty']||0)*parseFloat(r['Rate']||0);
+    html+='<tr><td><div style="font-weight:600">'+esc(itemName(r))+'</div><div style="font-size:9px;color:var(--sub)">'+esc(r['Item Name']||'')+'</div></td>';
+    html+='<td><span class="badge" style="background:#F1F5F9;color:var(--slate);border:1px solid var(--border)">'+esc(info.cat||'—')+'</span></td>';
+    html+='<td style="font-weight:500">'+esc(vendName(r))+'</td>';
+    html+='<td class="num">'+fmtNum(r['Qty'])+'<span style="color:var(--sub);font-size:9px;margin-left:3px">'+esc(info.unit||'')+'</span></td>';
+    html+='<td class="num">₹'+fmtNum(r['Rate'])+'</td>';
+    html+='<td class="num" style="color:var(--teal);font-weight:700">₹'+Math.round(amt).toLocaleString('en-IN')+'</td>';
+    html+='<td style="font-size:10px">'+fmtDate(r['Timestamp'])+'</td></tr>';
+  });
+  html+='</tbody></table></div>';
+  if(data.length>150) html+='<div style="text-align:center;padding:8px;font-size:11px;color:var(--sub)">Showing 150 of '+data.length+'</div>';
+  return html;
+}
+
+window._purFilter=function(){
+  var cat=(document.getElementById('pur-cat')||{}).value||'';
+  var sub=(document.getElementById('pur-sub')||{}).value||'';
+  var q=((document.getElementById('pur-search')||{}).value||'').toLowerCase();
+  var data=_D.purchasedItems.filter(function(r){
+    var info=r._itemInfo||(_M.item[String(r['Item Name']||'').trim()])||{};
+    if(cat&&info.cat!==cat) return false;
+    if(sub&&info.subcat!==sub) return false;
+    if(q){var h=(itemName(r)+' '+vendName(r)).toLowerCase();if(h.indexOf(q)===-1)return false;}
+    return true;
+  });
+  var wrap=document.getElementById('pur-table-wrap');
+  if(wrap) wrap.innerHTML=_purTable(data);
+};
+
+// ═══════════════════════════════════════════════════════════
+//  17. CSV EXPORT
+// ═══════════════════════════════════════════════════════════
+function exportCSV(){
+  var rows=filtered();
+  var cols=['OrderID','_customerName','_locationName','Expected Delivery Date','Delivery Boy','Vehicle No.','Crates Loaded','Returned Crates','WH Status','Email Status','Invoice','_status'];
+  var csv=cols.join(',')+'\n';
+  rows.forEach(function(o){csv+=cols.map(function(k){return '"'+String(o[k]||'').replace(/"/g,'""')+'"';}).join(',')+'\n';});
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='o2d-'+today()+'.csv';
   a.click();
-  URL.revokeObjectURL(url);
-  _toast('✓ CSV downloaded (' + rows.length + ' rows)', 'ok');
+  URL.revokeObjectURL(a.href);
+  toast('✓ CSV downloaded ('+rows.length+' rows, with resolved names)','ok');
 }
 
-// ────────────────────────────────────────────────────────────
-//  SECTION 18 — MODAL
-// ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  18. UI UTILS
+// ═══════════════════════════════════════════════════════════
+function setLoader(msg){var el=document.getElementById('loader'),t=document.getElementById('loader-txt');if(t)t.textContent=msg||'Loading…';if(el)el.classList.remove('hidden');}
+function hideLoader(){var el=document.getElementById('loader');if(el)el.classList.add('hidden');}
+function setBadge(cls,txt){var el=document.getElementById('data-badge');if(!el)return;el.className=cls;el.innerHTML=(cls==='loading'?'<i class="fas fa-circle-notch spinning" style="margin-right:4px"></i>':'')+txt;}
+var _tT;
+function toast(msg,type){var el=document.getElementById('toast');if(!el)return;el.textContent=msg;el.className='show'+(type?' '+type:'');clearTimeout(_tT);_tT=setTimeout(function(){el.className='';},3500);}
 
-function _openModal() {
-  document.getElementById('modal-overlay').classList.add('open');
-  document.getElementById('modal-sheet').classList.add('open');
-  document.body.style.overflow = 'hidden';
-}
-
-function _closeModal() {
-  document.getElementById('modal-overlay').classList.remove('open');
-  document.getElementById('modal-sheet').classList.remove('open');
-  document.body.style.overflow = '';
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 19 — UI UTILITIES
-// ────────────────────────────────────────────────────────────
-
-function _showOverlay(msg) {
-  var el = document.getElementById('loading-overlay');
-  var p  = document.getElementById('loading-msg');
-  if (p)  p.textContent = msg || 'Loading…';
-  if (el) el.classList.remove('hidden');
-}
-
-function _hideOverlay() {
-  var el = document.getElementById('loading-overlay');
-  if (el) el.classList.add('hidden');
-}
-
-function _setStatus(cls, txt) {
-  var el = document.getElementById('data-status');
-  if (!el) return;
-  el.className = cls;
-  el.textContent = txt;
-}
-
-var _toastTimer;
-function _toast(msg, type) {
-  var el = document.getElementById('toast');
-  if (!el) return;
-  el.textContent = msg;
-  el.className = 'show' + (type ? ' ' + type : '');
-  clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(function() {
-    el.className = '';
-  }, 3000);
-}
-
-// ────────────────────────────────────────────────────────────
-//  SECTION 20 — BOOT & EVENT WIRING
-// ────────────────────────────────────────────────────────────
-
-function _boot() {
-  // Tab switcher
-  document.querySelectorAll('.view-tab').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      _switchView(this.dataset.view);
-    });
-  });
-
-  // Refresh button
-  var refreshBtn = document.getElementById('refresh-btn');
-  if (refreshBtn) {
-    refreshBtn.addEventListener('click', function() {
-      _loadAll(false);
-    });
-  }
-
-  // Export button (top bar)
-  var exportBtn = document.getElementById('export-btn');
-  if (exportBtn) {
-    exportBtn.addEventListener('click', function() {
-      if (_currentView === 'table') _exportCSV();
-      else { _switchView('table'); _toast('Switch to Table view for CSV export'); }
-    });
-  }
-
-  // Modal close
-  var closeBtn = document.getElementById('modal-close-btn');
-  if (closeBtn) closeBtn.addEventListener('click', _closeModal);
-
-  var overlay = document.getElementById('modal-overlay');
-  if (overlay) overlay.addEventListener('click', _closeModal);
-
-  // Swipe down to close modal
-  var sheet    = document.getElementById('modal-sheet');
-  var startY   = 0;
-  if (sheet) {
-    sheet.addEventListener('touchstart', function(e) {
-      startY = e.touches[0].clientY;
-    }, { passive: true });
-    sheet.addEventListener('touchend', function(e) {
-      if (e.changedTouches[0].clientY - startY > 80) _closeModal();
-    }, { passive: true });
-  }
-
-  // Read URL param ?view=xxx
-  var urlParams = new URLSearchParams(window.location.search);
-  var initView  = urlParams.get('view') || APP_CONFIG.defaultView || 'kanban';
-
-  // Check if GAS URL is configured
-  if (!GAS_URL || GAS_URL === 'PASTE_YOUR_GAS_DEPLOYMENT_URL_HERE') {
-    _hideOverlay();
-    _setStatus('error', 'No URL');
-    document.getElementById('view-container').innerHTML =
-      '<div class="empty-state">' +
-      '<div class="empty-icon">⚙️</div>' +
-      '<p style="margin-bottom:12px"><strong>Setup Required</strong></p>' +
-      '<p>Open <code style="background:var(--bg-card2);padding:2px 6px;border-radius:4px">apiconfig.js</code> and paste your GAS deployment URL into <code>GAS_URL</code>, then commit.</p>' +
-      '</div>';
+// ═══════════════════════════════════════════════════════════
+//  19. BOOT
+// ═══════════════════════════════════════════════════════════
+function boot(){
+  if(gasUrlNotSet()){
+    hideLoader(); setBadge('error','Setup Required');
+    document.getElementById('content').innerHTML=
+      '<div class="empty"><i class="fas fa-cog" style="font-size:48px;color:var(--teal)"></i>'+
+      '<p>GAS URL Not Configured</p>'+
+      '<small>Open <strong>apiconfig.js</strong>, paste your Apps Script deployment URL into <code>GAS_URL</code>, then commit to GitHub.</small></div>';
     return;
   }
-
-  _currentView = initView;
-  _loadAll(false);
+  var p=new URLSearchParams(window.location.search);
+  _view=p.get('view')||APP_CONFIG.defaultView||'kanban';
+  loadAll(false);
 }
-
-// Fire after DOM ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', _boot);
-} else {
-  _boot();
-}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot); else boot();
