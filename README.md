@@ -277,4 +277,4 @@ GitHub Pages deploys in ~60 seconds.
 
 ---
 
-*Fresko O2D Analytics — Built by [Autoworkflow LLP](https://autoworkflow.in)*
+*Fresko O2D Analytics — Built by [AUTOWORKFLOW](https://autoworkflow.in)*
