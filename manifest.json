@@ -1,0 +1,48 @@
+{
+  "name": "O2D Analytics — Fresko",
+  "short_name": "O2D",
+  "description": "Order-to-Delivery Operations Dashboard for Fresko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0F1B2D",
+  "theme_color": "#0F1B2D",
+  "lang": "en",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-180.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "apple touch icon"
+    }
+  ],
+  "categories": ["business", "productivity"],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "Kanban View",
+      "short_name": "Kanban",
+      "url": "./?view=kanban",
+      "description": "Pipeline Kanban board"
+    },
+    {
+      "name": "Today's Orders",
+      "short_name": "Today",
+      "url": "./?view=list",
+      "description": "Today's delivery list"
+    }
+  ]
+}
