@@ -12,7 +12,7 @@
 //  4. Commit this file → GitHub Pages rebuilds
 // ============================================================
 
-var GAS_URL = 'https://script.google.com/macros/s/AKfycbxX3iG_G35Q3xK87v0Abfxmc0LTLTl-UYw4G57X5rV2CaIb6ffo-OM15iEYXrsqEvjQ/exec';
+var GAS_URL = 'https://script.google.com/macros/s/AKfycbzTTIx8Rhvn3efvyfA40AEeht8JYiIkaA1pMPPu94fTM1DReC2mzsl27dbvlqh6K4A/exec';
 // Example:
 // var GAS_URL = 'https://script.google.com/macros/s/AKfycby.../exec';
 
